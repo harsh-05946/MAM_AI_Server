@@ -1,7 +1,7 @@
 # app/main.py
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
-from typing import List
+from typing import List, Any
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from PIL import Image
@@ -10,6 +10,8 @@ import torch
 import time
 import logging
 import asyncio
+import json
+import io
 from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
@@ -17,6 +19,10 @@ load_dotenv()
 
 # Local imports
 from models import MODELS, load_main_models, unload_models, inference_ram, get_model_lock, get_runtime_model_status
+try:
+    from qwen_vl_utils import process_vision_info
+except Exception:
+    process_vision_info = None
 
 # Logging config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -74,6 +80,7 @@ SUPPORTED_LANGUAGES = {
     "telugu": "Telugu",
     "urdu": "Urdu",
 }
+QWEN_DEFAULT_PROMPT = "Provide a concise and accurate caption for this image."
 
 # ===============================
 # Helper for Locked Inference
@@ -161,6 +168,62 @@ def _sarvam_translate_sync(text: str, target_lang: str) -> str:
         )
 
     return output
+
+
+def _qwen_caption_sync(image: Image.Image, prompt: str) -> str:
+    qwen_bundle = MODELS.get("qwen_vl")
+    if qwen_bundle is None:
+        raise RuntimeError("Qwen model is not loaded")
+
+    processor = qwen_bundle["processor"]
+    model = qwen_bundle["model"]
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    if process_vision_info is not None:
+        image_inputs, video_inputs = process_vision_info(messages)
+    else:
+        image_inputs, video_inputs = [image], None
+
+    inputs = processor(
+        text=[chat_text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=256)
+
+    prompt_input_ids = getattr(inputs, "input_ids", None)
+    if hasattr(prompt_input_ids, "shape"):
+        prompt_len = prompt_input_ids.shape[1]
+    elif isinstance(prompt_input_ids, list) and prompt_input_ids:
+        prompt_len = len(prompt_input_ids[0])
+    else:
+        prompt_len = 0
+    if isinstance(generated_ids, list):
+        output_ids = [row[prompt_len:] for row in generated_ids]
+    else:
+        output_ids = generated_ids[:, prompt_len:]
+    output_text = processor.batch_decode(
+        output_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    if not output_text:
+        return ""
+    return output_text[0].strip()
 
 # ===============================
 # Face Recognition
@@ -304,6 +367,46 @@ async def sarvam_translation(req: SarvamTranslationRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         logger.info(f"🇮🇳 Sarvam finished in {time.perf_counter() - start:.3f}s")
+
+
+@app.post("/process/caption/qwen")
+async def qwen_caption(file: UploadFile = File(...), prompt: str = Form(QWEN_DEFAULT_PROMPT)):
+    logger.info(f"🖼️ Qwen caption request: {file.filename}")
+    if "qwen_vl" not in MODELS:
+        raise HTTPException(status_code=503, detail="Qwen caption model not available")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty upload")
+
+    try:
+        image = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
+    start = time.perf_counter()
+    prompt_used = (prompt or "").strip() or QWEN_DEFAULT_PROMPT
+    lock = get_model_lock("qwen_vl")
+    loop = asyncio.get_event_loop()
+
+    def _sync():
+        with lock:
+            caption = _qwen_caption_sync(image=image, prompt=prompt_used)
+            return {"caption": caption}
+
+    try:
+        payload = await loop.run_in_executor(executor, _sync)
+        return {
+            "caption": payload.get("caption", ""),
+            "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+            "prompt_used": prompt_used,
+            "duration_sec": round(time.perf_counter() - start, 4),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Qwen captioning failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 def health():

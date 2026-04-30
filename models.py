@@ -21,7 +21,7 @@ from transformers import (
     BertTokenizerFast,
     BlipForConditionalGeneration,
     BlipProcessor,
-    VibeVoiceAsrForConditionalGeneration,
+    Qwen2_5_VLForConditionalGeneration,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,10 +32,10 @@ MODEL_URLS = {
 
 MODEL_IDS = {
     "emotion": "trpakov/vit-face-expression",
-    "scene": "Salesforce/blip-image-captioning-large",
+    "scene": "Salesforce/blip-image-captioning-base",
     "embed": "sentence-transformers/all-MiniLM-L6-v2",
     "sarvam": "sarvamai/sarvam-translate",
-    "vibevoice": "microsoft/VibeVoice-ASR-HF",
+    "qwen_vl": "Qwen/Qwen2.5-VL-3B-Instruct",
 }
 
 MAIN_MODEL_SOURCE_ENV = {
@@ -43,11 +43,10 @@ MAIN_MODEL_SOURCE_ENV = {
     "scene": "LOCAL_BLIP_DIR",
     "embed": "LOCAL_EMBED_DIR",
     "sarvam": "LOCAL_SARVAM_DIR",
+    "qwen_vl": "LOCAL_QWEN_VL_DIR",
 }
 
-ASR_MODEL_SOURCE_ENV = {
-    "vibevoice": "LOCAL_VIBEVOICE_DIR",
-}
+
 
 PRETRAINED_DIR = Path(__file__).parent / "pretrained"
 DEFAULT_MODEL_CACHE_DIR = Path(__file__).parent / "models-local"
@@ -75,7 +74,7 @@ def _allow_hub_fallback() -> bool:
 
 
 def _local_dir_for(model_key: str, service: str) -> Optional[Path]:
-    env_map = MAIN_MODEL_SOURCE_ENV if service == "main" else ASR_MODEL_SOURCE_ENV
+    env_map = MAIN_MODEL_SOURCE_ENV
     env_name = env_map.get(model_key)
     if env_name and os.getenv(env_name):
         return Path(os.getenv(env_name)).expanduser()
@@ -92,7 +91,7 @@ def _resolve_model_source(model_key: str, service: str) -> tuple[str, bool]:
     if _allow_hub_fallback():
         return MODEL_IDS[model_key], False
 
-    env_map = MAIN_MODEL_SOURCE_ENV if service == "main" else ASR_MODEL_SOURCE_ENV
+    env_map = MAIN_MODEL_SOURCE_ENV
     env_name = env_map.get(model_key, "MODEL_PATH")
     raise RuntimeError(
         f"Offline mode active and local model path missing for '{model_key}'. "
@@ -258,31 +257,32 @@ def load_main_models():
         except Exception as e:
             logger.error(f"❌ Failed to load Sarvam model: {e}")
 
+        try:
+            if "qwen_vl" not in MODELS:
+                logger.info("📦 Loading Qwen2.5-VL model...")
+                source, is_local = _resolve_model_source("qwen_vl", service="main")
+                _log_model_source("qwen_vl", source, is_local)
+                qwen_processor = AutoProcessor.from_pretrained(source, **_hf_kwargs())
+                qwen_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch_dtype
+                qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    source,
+                    torch_dtype=qwen_dtype,
+                    **_hf_kwargs(),
+                ).to(device)
+                qwen_model.eval()
+                MODELS["qwen_vl"] = {
+                    "processor": qwen_processor,
+                    "model": qwen_model,
+                    "device": device,
+                }
+        except Exception as e:
+            logger.error(f"❌ Failed to load Qwen2.5-VL model: {e}")
+
+
     logger.info("✅ Main models loading sequence complete")
 
 
-def load_vibevoice_models():
-    """Load VibeVoice ASR model for dedicated ASR service."""
-    get_device_info()
 
-    with MODELS_LOCK:
-        try:
-            if "vibevoice" not in MODELS:
-                logger.info("📦 Loading Microsoft VibeVoice ASR...")
-                source, is_local = _resolve_model_source("vibevoice", service="asr")
-                _log_model_source("vibevoice", source, is_local)
-                vv_processor = AutoProcessor.from_pretrained(source, **_hf_kwargs())
-                vv_model = VibeVoiceAsrForConditionalGeneration.from_pretrained(
-                    source,
-                    device_map="auto",
-                    **_hf_kwargs(),
-                )
-                MODELS["vibevoice"] = {"processor": vv_processor, "model": vv_model}
-        except Exception as e:
-            logger.error(f"❌ Failed to load VibeVoice ASR: {e}")
-            raise RuntimeError(f"Critical failure: VibeVoice ASR is required for this service: {e}")
-
-    logger.info("✅ VibeVoice model loading sequence complete")
 
 
 def _download_weights(model_name: str) -> Path:
@@ -328,6 +328,7 @@ def get_runtime_model_status() -> dict:
         "allow_hf_fallback": _allow_hub_fallback(),
         "loaded_models": list(MODELS.keys()),
         "ram_plus_available": "ram_plus" in MODELS,
+        "qwen_vl_available": "qwen_vl" in MODELS,
     }
 
 
