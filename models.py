@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import urllib.request
+import gc
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +20,7 @@ from transformers import (
     AutoTokenizer,
     BertTokenizer,
     BertTokenizerFast,
+    BitsAndBytesConfig,
     BlipForConditionalGeneration,
     BlipProcessor,
     Qwen2_5_VLForConditionalGeneration,
@@ -32,7 +34,7 @@ MODEL_URLS = {
 
 MODEL_IDS = {
     "emotion": "trpakov/vit-face-expression",
-    "scene": "Salesforce/blip-image-captioning-base",
+    "scene": "Salesforce/blip-image-captioning-large",
     "embed": "sentence-transformers/all-MiniLM-L6-v2",
     "sarvam": "sarvamai/sarvam-translate",
     "qwen_vl": "Qwen/Qwen2.5-VL-3B-Instruct",
@@ -54,6 +56,12 @@ DEFAULT_MODEL_CACHE_DIR = Path(__file__).parent / "models-local"
 MODELS = {}
 MODEL_LOCKS = {}
 MODELS_LOCK = threading.RLock()
+GPU_LOCK = threading.Lock()
+
+QWEN_DEFAULT_MAX_PIXELS = 1024 * 1024
+QWEN_DEFAULT_MIN_PIXELS = 256 * 256
+QWEN_MAX_PIXELS = int(os.getenv("QWEN_MAX_PIXELS", str(QWEN_DEFAULT_MAX_PIXELS)))
+QWEN_MIN_PIXELS = int(os.getenv("QWEN_MIN_PIXELS", str(QWEN_DEFAULT_MIN_PIXELS)))
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -61,6 +69,12 @@ def _bool_env(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+ENABLE_QWEN_4BIT = _bool_env("ENABLE_QWEN_4BIT", True)
+ENABLE_SARVAM_4BIT = _bool_env("ENABLE_SARVAM_4BIT", True)
+if QWEN_MIN_PIXELS > QWEN_MAX_PIXELS:
+    QWEN_MIN_PIXELS = QWEN_MAX_PIXELS
 
 
 def _is_offline_mode() -> bool:
@@ -166,14 +180,50 @@ def get_model_lock(model_key: str) -> threading.Lock:
         return MODEL_LOCKS[model_key]
 
 
+def get_gpu_lock() -> threading.Lock:
+    return GPU_LOCK
+
+
+def clear_cuda_memory(reason: str = "") -> None:
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        if reason:
+            logger.info(f"🧹 Memory cleanup complete ({reason})")
+    except Exception as e:
+        logger.warning(f"Memory cleanup warning: {e}")
+
+
+def _build_4bit_config(enabled: bool, device: str) -> tuple[Optional[BitsAndBytesConfig], bool]:
+    if not enabled or device != "cuda":
+        return None, False
+    return (
+        BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        ),
+        True,
+    )
+
+
 def get_device_info():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-    if device == "cuda":
-        torch.backends.cuda.enable_flash_sdp(False)
-        torch.backends.cuda.enable_mem_efficient_sdp(False)
-        torch.backends.cuda.enable_math_sdp(True)
+    if device == "cuda" and hasattr(torch.backends, "cuda"):
+        try:
+            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                torch.backends.cuda.enable_flash_sdp(True)
+            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+            if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                torch.backends.cuda.enable_math_sdp(True)
+        except Exception as e:
+            logger.warning(f"Unable to set SDPA backend preferences: {e}")
 
     return device, torch_dtype
 
@@ -187,8 +237,9 @@ def load_main_models():
             if "face" not in MODELS:
                 logger.info("📦 Loading InsightFace...")
                 face_app = FaceAnalysis(name="buffalo_l")
-                face_app.prepare(ctx_id=0, det_size=(640, 640))
+                face_app.prepare(ctx_id=-1, det_size=(640, 640))
                 MODELS["face"] = face_app
+                logger.info("✅ InsightFace loaded on CPU")
         except Exception as e:
             logger.error(f"❌ Failed to load InsightFace: {e}")
 
@@ -232,7 +283,8 @@ def load_main_models():
                 logger.info("📦 Loading SentenceTransformer...")
                 source, is_local = _resolve_model_source("embed", service="main")
                 _log_model_source("embed", source, is_local)
-                MODELS["embed"] = SentenceTransformer(source)
+                MODELS["embed"] = SentenceTransformer(source, device="cpu")
+                logger.info("✅ SentenceTransformer loaded on CPU")
         except Exception as e:
             logger.error(f"❌ Failed to load SentenceTransformer: {e}")
 
@@ -243,17 +295,33 @@ def load_main_models():
                 _log_model_source("sarvam", source, is_local)
                 sarvam_tokenizer = AutoTokenizer.from_pretrained(source, **_hf_kwargs())
                 sarvam_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch_dtype
-                sarvam_model = AutoModelForCausalLM.from_pretrained(
-                    source,
-                    torch_dtype=sarvam_dtype,
-                    **_hf_kwargs(),
-                ).to(device)
+                sarvam_qconf, sarvam_quant_enabled = _build_4bit_config(ENABLE_SARVAM_4BIT, device)
+                sarvam_kwargs = dict(_hf_kwargs())
+                sarvam_kwargs["torch_dtype"] = sarvam_dtype
+                if sarvam_qconf is not None:
+                    sarvam_kwargs["quantization_config"] = sarvam_qconf
+                    sarvam_kwargs["device_map"] = "auto"
+                try:
+                    sarvam_model = AutoModelForCausalLM.from_pretrained(source, **sarvam_kwargs)
+                except Exception as quant_err:
+                    if sarvam_qconf is None:
+                        raise
+                    logger.warning(f"⚠️ Sarvam 4-bit load failed, falling back to non-quantized: {quant_err}")
+                    fallback_kwargs = dict(_hf_kwargs())
+                    fallback_kwargs["torch_dtype"] = sarvam_dtype
+                    sarvam_model = AutoModelForCausalLM.from_pretrained(source, **fallback_kwargs).to(device)
+                    sarvam_quant_enabled = False
+                if not sarvam_quant_enabled:
+                    sarvam_model = sarvam_model.to(device)
                 sarvam_model.eval()
                 MODELS["sarvam"] = {
                     "tokenizer": sarvam_tokenizer,
                     "model": sarvam_model,
                     "device": device,
+                    "quantized_4bit": sarvam_quant_enabled,
+                    "compute_dtype": str(sarvam_dtype),
                 }
+                logger.info(f"✅ Sarvam loaded on {device} (4bit={sarvam_quant_enabled}, compute_dtype={sarvam_dtype})")
         except Exception as e:
             logger.error(f"❌ Failed to load Sarvam model: {e}")
 
@@ -264,17 +332,33 @@ def load_main_models():
                 _log_model_source("qwen_vl", source, is_local)
                 qwen_processor = AutoProcessor.from_pretrained(source, **_hf_kwargs())
                 qwen_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch_dtype
-                qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    source,
-                    torch_dtype=qwen_dtype,
-                    **_hf_kwargs(),
-                ).to(device)
+                qwen_qconf, qwen_quant_enabled = _build_4bit_config(ENABLE_QWEN_4BIT, device)
+                qwen_kwargs = dict(_hf_kwargs())
+                qwen_kwargs["torch_dtype"] = qwen_dtype
+                if qwen_qconf is not None:
+                    qwen_kwargs["quantization_config"] = qwen_qconf
+                    qwen_kwargs["device_map"] = "auto"
+                try:
+                    qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(source, **qwen_kwargs)
+                except Exception as quant_err:
+                    if qwen_qconf is None:
+                        raise
+                    logger.warning(f"⚠️ Qwen 4-bit load failed, falling back to non-quantized: {quant_err}")
+                    fallback_kwargs = dict(_hf_kwargs())
+                    fallback_kwargs["torch_dtype"] = qwen_dtype
+                    qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(source, **fallback_kwargs).to(device)
+                    qwen_quant_enabled = False
+                if not qwen_quant_enabled:
+                    qwen_model = qwen_model.to(device)
                 qwen_model.eval()
                 MODELS["qwen_vl"] = {
                     "processor": qwen_processor,
                     "model": qwen_model,
                     "device": device,
+                    "quantized_4bit": qwen_quant_enabled,
+                    "compute_dtype": str(qwen_dtype),
                 }
+                logger.info(f"✅ Qwen2.5-VL loaded on {device} (4bit={qwen_quant_enabled}, compute_dtype={qwen_dtype})")
         except Exception as e:
             logger.error(f"❌ Failed to load Qwen2.5-VL model: {e}")
 
@@ -335,6 +419,5 @@ def get_runtime_model_status() -> dict:
 def unload_models():
     with MODELS_LOCK:
         MODELS.clear()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        clear_cuda_memory(reason="shutdown")
         logger.info("🧹 All models unloaded")

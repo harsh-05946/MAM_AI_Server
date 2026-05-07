@@ -12,13 +12,25 @@ import logging
 import asyncio
 import json
 import io
+import math
 from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
 load_dotenv()
 
 # Local imports
-from models import MODELS, load_main_models, unload_models, inference_ram, get_model_lock, get_runtime_model_status
+from models import (
+    MODELS,
+    load_main_models,
+    unload_models,
+    inference_ram,
+    get_model_lock,
+    get_runtime_model_status,
+    get_gpu_lock,
+    clear_cuda_memory,
+    QWEN_MAX_PIXELS,
+    QWEN_MIN_PIXELS,
+)
 try:
     from qwen_vl_utils import process_vision_info
 except Exception:
@@ -29,6 +41,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 executor = ThreadPoolExecutor(max_workers=4)
+GPU_LOCK = get_gpu_lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -80,7 +93,7 @@ SUPPORTED_LANGUAGES = {
     "telugu": "Telugu",
     "urdu": "Urdu",
 }
-QWEN_DEFAULT_PROMPT = "Provide a concise and accurate caption for this image."
+QWEN_DEFAULT_PROMPT = "Extract all text present in the image and return only that text, without any additional explanation or formatting. Preserve the original language exactly as it appears, and do not translate it."
 
 # ===============================
 # Helper for Locked Inference
@@ -194,13 +207,22 @@ def _qwen_caption_sync(image: Image.Image, prompt: str) -> str:
     else:
         image_inputs, video_inputs = [image], None
 
-    inputs = processor(
+    processor_kwargs = dict(
         text=[chat_text],
         images=image_inputs,
         videos=video_inputs,
         padding=True,
         return_tensors="pt",
-    ).to(model.device)
+        max_pixels=max(QWEN_MAX_PIXELS, 1),
+        min_pixels=max(min(QWEN_MIN_PIXELS, QWEN_MAX_PIXELS), 1),
+    )
+    try:
+        inputs = processor(**processor_kwargs).to(model.device)
+    except TypeError:
+        # Fallback for processor builds that do not expose max/min pixel kwargs.
+        processor_kwargs.pop("max_pixels", None)
+        processor_kwargs.pop("min_pixels", None)
+        inputs = processor(**processor_kwargs).to(model.device)
 
     with torch.no_grad():
         generated_ids = model.generate(**inputs, max_new_tokens=256)
@@ -225,6 +247,21 @@ def _qwen_caption_sync(image: Image.Image, prompt: str) -> str:
         return ""
     return output_text[0].strip()
 
+
+def _downsample_to_max_pixels(image: Image.Image, max_pixels: int) -> tuple[Image.Image, tuple[int, int], tuple[int, int]]:
+    original = image.size
+    if max_pixels <= 0:
+        return image, original, original
+    current_pixels = original[0] * original[1]
+    if current_pixels <= max_pixels:
+        return image, original, original
+
+    scale = math.sqrt(max_pixels / float(current_pixels))
+    new_w = max(1, int(original[0] * scale))
+    new_h = max(1, int(original[1] * scale))
+    resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    return resized, original, resized.size
+
 # ===============================
 # Face Recognition
 # ===============================
@@ -237,7 +274,10 @@ async def face_recognition(file: UploadFile = File(...)):
     
     lock = get_model_lock("face")
     loop = asyncio.get_event_loop()
-    faces = await loop.run_in_executor(executor, lambda: _lock_inference(lock, lambda: MODELS["face"].get(img_np)))
+    try:
+        faces = await loop.run_in_executor(executor, lambda: _lock_inference(lock, lambda: MODELS["face"].get(img_np)))
+    finally:
+        clear_cuda_memory("after face stage")
 
     duration = time.perf_counter() - start
     logger.info(f"🧑 Face recognition finished in {duration:.3f}s")
@@ -257,21 +297,25 @@ async def emotion_detection(file: UploadFile = File(...)):
     
     lock = get_model_lock("emotion")
     def _sync():
-        with lock:
-            proc = MODELS["emotion"]["processor"]
-            model = MODELS["emotion"]["model"]
-            inputs = proc(images=image, return_tensors="pt").to(model.device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            probs = outputs.logits.softmax(dim=-1)[0]
-            idx = probs.argmax().item()
-            return {"emotion": model.config.id2label[idx], "confidence": float(probs[idx])}
+        with GPU_LOCK:
+            with lock:
+                proc = MODELS["emotion"]["processor"]
+                model = MODELS["emotion"]["model"]
+                inputs = proc(images=image, return_tensors="pt").to(model.device)
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                probs = outputs.logits.softmax(dim=-1)[0]
+                idx = probs.argmax().item()
+                return {"emotion": model.config.id2label[idx], "confidence": float(probs[idx])}
 
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, _sync)
-    duration = time.perf_counter() - start
-    logger.info(f"😊 Emotion finished in {duration:.3f}s")
-    return result
+    try:
+        result = await loop.run_in_executor(executor, _sync)
+        return result
+    finally:
+        duration = time.perf_counter() - start
+        logger.info(f"😊 Emotion finished in {duration:.3f}s")
+        clear_cuda_memory("after emotion stage")
 
 # ===============================
 # Scene Description
@@ -284,19 +328,23 @@ async def scene_description(file: UploadFile = File(...)):
     
     lock = get_model_lock("scene")
     def _sync():
-        with lock:
-            proc = MODELS["scene"]["processor"]
-            model = MODELS["scene"]["model"]
-            inputs = proc(images=image, return_tensors="pt").to(model.device)
-            with torch.no_grad():
-                out = model.generate(**inputs, max_new_tokens=50)
-            return {"scene": proc.decode(out[0], skip_special_tokens=True)}
+        with GPU_LOCK:
+            with lock:
+                proc = MODELS["scene"]["processor"]
+                model = MODELS["scene"]["model"]
+                inputs = proc(images=image, return_tensors="pt").to(model.device)
+                with torch.no_grad():
+                    out = model.generate(**inputs, max_new_tokens=50)
+                return {"scene": proc.decode(out[0], skip_special_tokens=True)}
 
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, _sync)
-    duration = time.perf_counter() - start
-    logger.info(f"🖼️ Scene finished in {duration:.3f}s")
-    return result
+    try:
+        result = await loop.run_in_executor(executor, _sync)
+        return result
+    finally:
+        duration = time.perf_counter() - start
+        logger.info(f"🖼️ Scene finished in {duration:.3f}s")
+        clear_cuda_memory("after scene stage")
 
 # ===============================
 # Object Detection (RAM++)
@@ -313,18 +361,22 @@ async def object_detection(file: UploadFile = File(...)):
     
     lock = get_model_lock("ram_plus")
     def _sync():
-        with lock:
-            m = MODELS["ram_plus"]
-            image_tensor = m["transform"](image).unsqueeze(0).to(m["device"])
-            with torch.no_grad():
-                tags_en, tags_cn = inference_ram(image_tensor, m["model"])
-            return {"tags_en": tags_en, "tags_cn": tags_cn}
+        with GPU_LOCK:
+            with lock:
+                m = MODELS["ram_plus"]
+                image_tensor = m["transform"](image).unsqueeze(0).to(m["device"])
+                with torch.no_grad():
+                    tags_en, tags_cn = inference_ram(image_tensor, m["model"])
+                return {"tags_en": tags_en, "tags_cn": tags_cn}
 
     loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(executor, _sync)
-    duration = time.perf_counter() - start
-    logger.info(f"🏷️ RAM++ finished in {duration:.3f}s")
-    return result
+    try:
+        result = await loop.run_in_executor(executor, _sync)
+        return result
+    finally:
+        duration = time.perf_counter() - start
+        logger.info(f"🏷️ RAM++ finished in {duration:.3f}s")
+        clear_cuda_memory("after ram++")
 
 # ===============================
 # Text Embeddings
@@ -352,9 +404,10 @@ async def sarvam_translation(req: SarvamTranslationRequest):
 
     lock = get_model_lock("sarvam")
     def _sync():
-        with lock:
-            translated = _sarvam_translate_sync(text=req.text, target_lang=req.target_lang)
-            return {"output": translated}
+        with GPU_LOCK:
+            with lock:
+                translated = _sarvam_translate_sync(text=req.text, target_lang=req.target_lang)
+                return {"output": translated}
 
     loop = asyncio.get_event_loop()
     try:
@@ -367,6 +420,7 @@ async def sarvam_translation(req: SarvamTranslationRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         logger.info(f"🇮🇳 Sarvam finished in {time.perf_counter() - start:.3f}s")
+        clear_cuda_memory("after sarvam")
 
 
 @app.post("/process/caption/qwen")
@@ -384,17 +438,26 @@ async def qwen_caption(file: UploadFile = File(...), prompt: str = Form(QWEN_DEF
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
+    image, original_size, processed_size = _downsample_to_max_pixels(image, max(QWEN_MAX_PIXELS, 1))
+    if original_size != processed_size:
+        logger.info(
+            f"🧮 Qwen image downsampled from {original_size[0]}x{original_size[1]} "
+            f"to {processed_size[0]}x{processed_size[1]} (max_pixels={QWEN_MAX_PIXELS})"
+        )
+
     start = time.perf_counter()
     prompt_used = (prompt or "").strip() or QWEN_DEFAULT_PROMPT
     lock = get_model_lock("qwen_vl")
     loop = asyncio.get_event_loop()
 
     def _sync():
-        with lock:
-            caption = _qwen_caption_sync(image=image, prompt=prompt_used)
-            return {"caption": caption}
+        with GPU_LOCK:
+            with lock:
+                caption = _qwen_caption_sync(image=image, prompt=prompt_used)
+                return {"caption": caption}
 
     try:
+        clear_cuda_memory("before qwen caption")
         payload = await loop.run_in_executor(executor, _sync)
         return {
             "caption": payload.get("caption", ""),
@@ -407,6 +470,8 @@ async def qwen_caption(file: UploadFile = File(...), prompt: str = Form(QWEN_DEF
     except Exception as e:
         logger.exception("Qwen captioning failed")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        clear_cuda_memory("after qwen caption")
 
 @app.get("/health")
 def health():

@@ -16,6 +16,7 @@ PID_FILE=/home/ubuntu/app/main_api.pid
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
 export ALLOW_HF_FALLBACK=${ALLOW_HF_FALLBACK:-1}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 # Do not force local model paths here. Let loaders resolve defaults (HF online/cache).
 
@@ -26,8 +27,8 @@ fi
 
 echo "🚀 Starting Main Inference API on port $PORT..."
 echo "HF_HUB_OFFLINE=$HF_HUB_OFFLINE TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE ALLOW_HF_FALLBACK=$ALLOW_HF_FALLBACK"
-nohup uvicorn main:app --host "$HOST" --port "$PORT" --workers 1 >> "$LOG_FILE" 2>&1 &
-echo $! > "$PID_FILE"
+echo "PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+exec uvicorn main:app --host "$HOST" --port "$PORT" --workers 1
 
 sleep 2
 if pgrep -f "uvicorn main:app" > /dev/null; then
