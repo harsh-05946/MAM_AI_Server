@@ -13,6 +13,8 @@ import asyncio
 import json
 import io
 import math
+import os
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
@@ -42,6 +44,216 @@ logger = logging.getLogger(__name__)
 
 executor = ThreadPoolExecutor(max_workers=4)
 GPU_LOCK = get_gpu_lock()
+BATCHERS: dict[str, "MicroBatcher"] = {}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+BATCHING_ENABLED = _env_bool("BATCHING_ENABLED", True)
+
+
+@dataclass
+class BatchItem:
+    payload: Any
+    future: asyncio.Future
+
+
+class MicroBatcher:
+    def __init__(self, model_key: str, max_batch_size: int, max_wait_ms: int, process_fn):
+        self.model_key = model_key
+        self.max_batch_size = max(1, max_batch_size)
+        self.max_wait_ms = max(0, max_wait_ms)
+        self.process_fn = process_fn
+        self.queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._task: asyncio.Task | None = None
+        self._running = False
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._run(), name=f"{self.model_key}-batch-worker")
+
+    async def stop(self):
+        if not self._running:
+            return
+        self._running = False
+        await self.queue.put(None)
+        if self._task is not None:
+            await self._task
+            self._task = None
+
+    async def submit(self, payload: Any):
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await self.queue.put(BatchItem(payload=payload, future=fut))
+        return await fut
+
+    async def _run(self):
+        while True:
+            first = await self.queue.get()
+            if first is None:
+                break
+
+            batch = [first]
+            start = time.perf_counter()
+            wait_sec = self.max_wait_ms / 1000.0
+
+            while len(batch) < self.max_batch_size:
+                elapsed = time.perf_counter() - start
+                remaining = wait_sec - elapsed
+                if remaining <= 0:
+                    break
+                try:
+                    nxt = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                if nxt is None:
+                    await self.queue.put(None)
+                    break
+                batch.append(nxt)
+
+            payloads = [item.payload for item in batch]
+            try:
+                if len(batch) > 1:
+                    logger.info(
+                        f"⚡ {self.model_key} micro-batch formed: size={len(batch)} "
+                        f"(max={self.max_batch_size}, wait_ms={self.max_wait_ms})"
+                    )
+                results = await asyncio.get_running_loop().run_in_executor(
+                    executor, lambda: self.process_fn(payloads)
+                )
+                if len(results) != len(batch):
+                    raise RuntimeError(
+                        f"{self.model_key} batch result size mismatch: "
+                        f"expected {len(batch)}, got {len(results)}"
+                    )
+                for item, result in zip(batch, results):
+                    if not item.future.done():
+                        item.future.set_result(result)
+            except Exception as e:
+                for item in batch:
+                    if not item.future.done():
+                        item.future.set_exception(e)
+
+
+def _process_emotion_batch(images: list[Image.Image]) -> list[dict[str, Any]]:
+    lock = get_model_lock("emotion")
+    with GPU_LOCK:
+        with lock:
+            proc = MODELS["emotion"]["processor"]
+            model = MODELS["emotion"]["model"]
+            inputs = proc(images=images, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                outputs = model(**inputs)
+            probs = outputs.logits.softmax(dim=-1)
+            results = []
+            for row in probs:
+                idx = row.argmax().item()
+                results.append({"emotion": model.config.id2label[idx], "confidence": float(row[idx])})
+            return results
+
+
+def _process_scene_batch(images: list[Image.Image]) -> list[dict[str, str]]:
+    lock = get_model_lock("scene")
+    with GPU_LOCK:
+        with lock:
+            proc = MODELS["scene"]["processor"]
+            model = MODELS["scene"]["model"]
+            inputs = proc(images=images, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                generated = model.generate(**inputs, max_new_tokens=50)
+            return [{"scene": proc.decode(seq, skip_special_tokens=True)} for seq in generated]
+
+
+def _run_ram_single(m: dict[str, Any], image: Image.Image) -> tuple[Any, Any]:
+    image_tensor = m["transform"](image).unsqueeze(0).to(m["device"])
+    with torch.no_grad():
+        tags_en, tags_cn = inference_ram(image_tensor, m["model"])
+    return tags_en, tags_cn
+
+
+def _process_ram_batch(images: list[Image.Image]) -> list[dict[str, Any]]:
+    lock = get_model_lock("ram_plus")
+    with GPU_LOCK:
+        with lock:
+            m = MODELS["ram_plus"]
+            try:
+                image_tensor = torch.stack([m["transform"](img) for img in images]).to(m["device"])
+                with torch.no_grad():
+                    tags_en, tags_cn = inference_ram(image_tensor, m["model"])
+                if isinstance(tags_en, list) and isinstance(tags_cn, list):
+                    if len(tags_en) == len(images) and len(tags_cn) == len(images):
+                        return [{"tags_en": en, "tags_cn": cn} for en, cn in zip(tags_en, tags_cn)]
+            except Exception:
+                # Fallback to per-item inference if RAM++ runtime expects batch=1.
+                pass
+
+            out = []
+            for img in images:
+                en, cn = _run_ram_single(m, img)
+                out.append({"tags_en": en, "tags_cn": cn})
+            return out
+
+
+def _process_face_batch(images_np: list[np.ndarray]) -> list[list[Any]]:
+    lock = get_model_lock("face")
+    with lock:
+        model = MODELS["face"]
+        return [model.get(img_np) for img_np in images_np]
+
+
+def _init_batchers():
+    if not BATCHING_ENABLED:
+        logger.info("ℹ️ Internal micro-batching disabled (BATCHING_ENABLED=false)")
+        return
+
+    configs = {
+        "emotion": (_env_int("BATCH_MAX_EMOTION", 16), _env_int("BATCH_WAIT_MS_EMOTION", 8), _process_emotion_batch),
+        "scene": (_env_int("BATCH_MAX_SCENE", 8), _env_int("BATCH_WAIT_MS_SCENE", 10), _process_scene_batch),
+        "ram_plus": (_env_int("BATCH_MAX_RAM_PLUS", 8), _env_int("BATCH_WAIT_MS_RAM_PLUS", 10), _process_ram_batch),
+        "face": (_env_int("BATCH_MAX_FACE", 4), _env_int("BATCH_WAIT_MS_FACE", 8), _process_face_batch),
+    }
+
+    for model_key, (max_batch, wait_ms, fn) in configs.items():
+        if model_key not in MODELS:
+            continue
+        batcher = MicroBatcher(model_key=model_key, max_batch_size=max_batch, max_wait_ms=wait_ms, process_fn=fn)
+        batcher.start()
+        BATCHERS[model_key] = batcher
+        logger.info(f"⚡ Micro-batching enabled for {model_key} (max_batch={max_batch}, wait_ms={wait_ms})")
+
+
+async def _shutdown_batchers():
+    for model_key, batcher in list(BATCHERS.items()):
+        try:
+            await batcher.stop()
+        except Exception as e:
+            logger.warning(f"Failed stopping batcher {model_key}: {e}")
+    BATCHERS.clear()
+
+
+async def _submit_or_run(model_key: str, payload: Any, fallback_sync):
+    batcher = BATCHERS.get(model_key)
+    if batcher is not None:
+        return await batcher.submit(payload)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, fallback_sync)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,10 +261,12 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting Main Inference Service")
     start = time.perf_counter()
     load_main_models()
+    _init_batchers()
     logger.info(f"✅ Main models loaded in {(time.perf_counter() - start):.2f}s")
     yield
     # Shutdown
     logger.info("🛑 Stopping Main Inference Service")
+    await _shutdown_batchers()
     unload_models()
     executor.shutdown(wait=True)
 
@@ -275,7 +489,11 @@ async def face_recognition(file: UploadFile = File(...)):
     lock = get_model_lock("face")
     loop = asyncio.get_event_loop()
     try:
-        faces = await loop.run_in_executor(executor, lambda: _lock_inference(lock, lambda: MODELS["face"].get(img_np)))
+        faces = await _submit_or_run(
+            "face",
+            img_np,
+            lambda: _lock_inference(lock, lambda: MODELS["face"].get(img_np)),
+        )
     finally:
         clear_cuda_memory("after face stage")
 
@@ -295,22 +513,12 @@ async def emotion_detection(file: UploadFile = File(...)):
     start = time.perf_counter()
     image = Image.open(file.file).convert("RGB")
     
-    lock = get_model_lock("emotion")
-    def _sync():
-        with GPU_LOCK:
-            with lock:
-                proc = MODELS["emotion"]["processor"]
-                model = MODELS["emotion"]["model"]
-                inputs = proc(images=image, return_tensors="pt").to(model.device)
-                with torch.no_grad():
-                    outputs = model(**inputs)
-                probs = outputs.logits.softmax(dim=-1)[0]
-                idx = probs.argmax().item()
-                return {"emotion": model.config.id2label[idx], "confidence": float(probs[idx])}
-
-    loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(executor, _sync)
+        result = await _submit_or_run(
+            "emotion",
+            image,
+            lambda: _process_emotion_batch([image])[0],
+        )
         return result
     finally:
         duration = time.perf_counter() - start
@@ -326,20 +534,12 @@ async def scene_description(file: UploadFile = File(...)):
     start = time.perf_counter()
     image = Image.open(file.file).convert("RGB")
     
-    lock = get_model_lock("scene")
-    def _sync():
-        with GPU_LOCK:
-            with lock:
-                proc = MODELS["scene"]["processor"]
-                model = MODELS["scene"]["model"]
-                inputs = proc(images=image, return_tensors="pt").to(model.device)
-                with torch.no_grad():
-                    out = model.generate(**inputs, max_new_tokens=50)
-                return {"scene": proc.decode(out[0], skip_special_tokens=True)}
-
-    loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(executor, _sync)
+        result = await _submit_or_run(
+            "scene",
+            image,
+            lambda: _process_scene_batch([image])[0],
+        )
         return result
     finally:
         duration = time.perf_counter() - start
@@ -359,19 +559,12 @@ async def object_detection(file: UploadFile = File(...)):
     start = time.perf_counter()
     image = Image.open(file.file).convert("RGB")
     
-    lock = get_model_lock("ram_plus")
-    def _sync():
-        with GPU_LOCK:
-            with lock:
-                m = MODELS["ram_plus"]
-                image_tensor = m["transform"](image).unsqueeze(0).to(m["device"])
-                with torch.no_grad():
-                    tags_en, tags_cn = inference_ram(image_tensor, m["model"])
-                return {"tags_en": tags_en, "tags_cn": tags_cn}
-
-    loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(executor, _sync)
+        result = await _submit_or_run(
+            "ram_plus",
+            image,
+            lambda: _process_ram_batch([image])[0],
+        )
         return result
     finally:
         duration = time.perf_counter() - start
