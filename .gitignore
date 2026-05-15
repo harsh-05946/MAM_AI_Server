@@ -1,8 +1,62 @@
-*venv
-__pycache__
-pretrained/*
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env/
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# --- Secrets / local env (keep .env.example tracked with ! if you add one) ---
+.env
+.env.*
+!.env.example
+
+# --- ML weights & caches (heavy) ---
+pretrained/
+models-local/
+.cache/
+**/.huggingface/
+
+# Common local weight / export extensions under the repo (uncomment if you never commit these)
+# *.onnx
+# *.pt
+# *.pth
+# *.bin
+# *.safetensors
+# *.ckpt
+
+# --- Runtime logs & PIDs ---
 *.log
 *.pid
-*.json
-*.env
-models-local/*
+nginx-run/*.log
+nginx-run/nginx.pid
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+
+# --- Experiments / tooling output ---
+wandb/
+lightning_logs/
+mlruns/
+tmp/
+temp/
+.tmp/

@@ -235,11 +235,22 @@ def load_main_models():
     with MODELS_LOCK:
         try:
             if "face" not in MODELS:
-                logger.info("📦 Loading InsightFace...")
-                face_app = FaceAnalysis(name="buffalo_l")
-                face_app.prepare(ctx_id=-1, det_size=(640, 640))
-                MODELS["face"] = face_app
-                logger.info("✅ InsightFace loaded on CPU")
+                if not torch.cuda.is_available():
+                    logger.error(
+                        "❌ InsightFace not loaded: GPU-only mode requires CUDA "
+                        "(torch.cuda.is_available() is False)"
+                    )
+                else:
+                    logger.info("📦 Loading InsightFace (GPU-only)...")
+                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                    try:
+                        face_app = FaceAnalysis(name="buffalo_l", providers=providers)
+                    except TypeError:
+                        # Older insightface builds may not accept 'providers='.
+                        face_app = FaceAnalysis(name="buffalo_l")
+                    face_app.prepare(ctx_id=0, det_size=(640, 640))
+                    MODELS["face"] = face_app
+                    logger.info("✅ InsightFace loaded on cuda (GPU-only)")
         except Exception as e:
             logger.error(f"❌ Failed to load InsightFace: {e}")
 
@@ -283,8 +294,9 @@ def load_main_models():
                 logger.info("📦 Loading SentenceTransformer...")
                 source, is_local = _resolve_model_source("embed", service="main")
                 _log_model_source("embed", source, is_local)
-                MODELS["embed"] = SentenceTransformer(source, device="cpu")
-                logger.info("✅ SentenceTransformer loaded on CPU")
+                st_device = "cuda" if device == "cuda" else "cpu"
+                MODELS["embed"] = SentenceTransformer(source, device=st_device)
+                logger.info(f"✅ SentenceTransformer loaded on {st_device}")
         except Exception as e:
             logger.error(f"❌ Failed to load SentenceTransformer: {e}")
 
@@ -407,13 +419,25 @@ def _load_ram_plus_model(device: str):
 
 
 def get_runtime_model_status() -> dict:
-    return {
+    payload = {
         "offline_mode": _is_offline_mode(),
         "allow_hf_fallback": _allow_hub_fallback(),
         "loaded_models": list(MODELS.keys()),
         "ram_plus_available": "ram_plus" in MODELS,
         "qwen_vl_available": "qwen_vl" in MODELS,
     }
+    if torch.cuda.is_available():
+        try:
+            payload.update(
+                {
+                    "cuda_device": torch.cuda.get_device_name(0),
+                    "cuda_mem_allocated": int(torch.cuda.memory_allocated()),
+                    "cuda_mem_reserved": int(torch.cuda.memory_reserved()),
+                }
+            )
+        except Exception:
+            pass
+    return payload
 
 
 def unload_models():

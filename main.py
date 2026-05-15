@@ -1,7 +1,7 @@
 # app/main.py
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from pydantic import BaseModel
-from typing import List, Any
+from typing import List, Any, Union
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from PIL import Image
@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=4)
 GPU_LOCK = get_gpu_lock()
 BATCHERS: dict[str, "MicroBatcher"] = {}
+INFLIGHT_REQUESTS = 0
+INSTANCE_NAME = os.getenv("INSTANCE_NAME", "main")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -218,6 +220,35 @@ def _process_face_batch(images_np: list[np.ndarray]) -> list[list[Any]]:
         return [model.get(img_np) for img_np in images_np]
 
 
+def _process_embed_batch(texts: list[str]) -> list[list[float]]:
+    """Run SentenceTransformer.encode for one or more strings; returns one vector per string (order preserved)."""
+    if not texts:
+        return []
+    lock = get_model_lock("embed")
+    with lock:
+        embedder = MODELS["embed"]
+        batch_size_kw: dict[str, int] = {}
+        bs = _env_int("EMBED_ENCODE_BATCH_SIZE", 0)
+        if bs > 0:
+            batch_size_kw["batch_size"] = bs
+        out: Union[np.ndarray, torch.Tensor, list] = embedder.encode(texts, **batch_size_kw)
+    if isinstance(out, torch.Tensor):
+        out = out.detach().cpu().numpy()
+    if not isinstance(out, np.ndarray):
+        raise TypeError(f"Unexpected embed encode output type: {type(out)}")
+    if out.ndim == 1:
+        if len(texts) != 1:
+            raise RuntimeError("embed encode returned 1d array for multi-text batch")
+        return [out.tolist()]
+    if out.shape[0] != len(texts):
+        raise RuntimeError(f"embed batch size mismatch: texts={len(texts)} rows={out.shape[0]}")
+    return [out[i].tolist() for i in range(out.shape[0])]
+
+
+def _process_embed_microbatch_payloads(texts: list[str]) -> list[list[float]]:
+    return _process_embed_batch(texts)
+
+
 def _init_batchers():
     if not BATCHING_ENABLED:
         logger.info("ℹ️ Internal micro-batching disabled (BATCHING_ENABLED=false)")
@@ -228,6 +259,7 @@ def _init_batchers():
         "scene": (_env_int("BATCH_MAX_SCENE", 8), _env_int("BATCH_WAIT_MS_SCENE", 10), _process_scene_batch),
         "ram_plus": (_env_int("BATCH_MAX_RAM_PLUS", 8), _env_int("BATCH_WAIT_MS_RAM_PLUS", 10), _process_ram_batch),
         "face": (_env_int("BATCH_MAX_FACE", 4), _env_int("BATCH_WAIT_MS_FACE", 8), _process_face_batch),
+        "embed": (_env_int("BATCH_MAX_EMBED", 32), _env_int("BATCH_WAIT_MS_EMBED", 8), _process_embed_microbatch_payloads),
     }
 
     for model_key, (max_batch, wait_ms, fn) in configs.items():
@@ -271,6 +303,16 @@ async def lifespan(app: FastAPI):
     executor.shutdown(wait=True)
 
 app = FastAPI(title="General Inference Server", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def track_inflight_requests(request: Request, call_next):
+    global INFLIGHT_REQUESTS
+    INFLIGHT_REQUESTS += 1
+    try:
+        return await call_next(request)
+    finally:
+        INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
 
 class EmbeddingRequest(BaseModel):
     texts: List[str]
@@ -482,6 +524,11 @@ def _downsample_to_max_pixels(image: Image.Image, max_pixels: int) -> tuple[Imag
 @app.post("/process/face")
 async def face_recognition(file: UploadFile = File(...)):
     logger.info(f"🧑 Face recognition: {file.filename}")
+    if MODELS.get("face") is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Face recognition model not available (CUDA GPU required)",
+        )
     start = time.perf_counter()
     img = Image.open(file.file).convert("RGB")
     img_np = np.array(img)
@@ -524,6 +571,46 @@ async def emotion_detection(file: UploadFile = File(...)):
         duration = time.perf_counter() - start
         logger.info(f"😊 Emotion finished in {duration:.3f}s")
         clear_cuda_memory("after emotion stage")
+
+
+@app.post("/process/emotion/batch")
+async def emotion_detection_batch(files: List[UploadFile] = File(..., description="Repeat form field 'files' for each image")):
+    """Classify emotion for many face crops in one ViT forward (multipart, same field name 'files')."""
+    max_n = max(1, _env_int("EMOTION_BATCH_MAX", 32))
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+    if len(files) > max_n:
+        raise HTTPException(status_code=400, detail=f"At most {max_n} images allowed (EMOTION_BATCH_MAX)")
+
+    images: list[Image.Image] = []
+    names: list[str] = []
+    for uf in files:
+        raw = await uf.read()
+        try:
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid image file: {uf.filename!r}")
+        images.append(img)
+        names.append(uf.filename or "")
+
+    start = time.perf_counter()
+    loop = asyncio.get_event_loop()
+    try:
+        results = await loop.run_in_executor(
+            executor,
+            lambda ims=list(images): _process_emotion_batch(ims),
+        )
+    finally:
+        clear_cuda_memory("after emotion batch stage")
+        logger.info(f"😊 Emotion batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
+
+    out: list[dict[str, Any]] = []
+    for name, row in zip(names, results):
+        item = dict(row)
+        if name:
+            item["filename"] = name
+        out.append(item)
+    return out
 
 # ===============================
 # Scene Description
@@ -576,16 +663,33 @@ async def object_detection(file: UploadFile = File(...)):
 # ===============================
 @app.post("/process/embeddings")
 async def create_embeddings(req: EmbeddingRequest):
+    if not req.texts:
+        raise HTTPException(status_code=400, detail="texts must be a non-empty list")
+
     logger.info(f"🔗 Embeddings request: {len(req.texts)} items")
     start = time.perf_counter()
-    
-    lock = get_model_lock("embed")
     loop = asyncio.get_event_loop()
-    embeddings = await loop.run_in_executor(executor, lambda: _lock_inference(lock, lambda: MODELS["embed"].encode(req.texts)))
-    
+
+    if len(req.texts) == 1:
+        text = req.texts[0]
+        batcher = BATCHERS.get("embed")
+        if batcher is not None:
+            vec = await batcher.submit(text)
+        else:
+            vec = await loop.run_in_executor(
+                executor,
+                lambda t=text: _process_embed_batch([t])[0],
+            )
+        embeddings = [vec]
+    else:
+        embeddings = await loop.run_in_executor(
+            executor,
+            lambda texts=list(req.texts): _process_embed_batch(texts),
+        )
+
     duration = time.perf_counter() - start
     logger.info(f"🔗 Embeddings finished in {duration:.3f}s")
-    return {"embeddings": [emb.tolist() for emb in embeddings], "count": len(embeddings)}
+    return {"embeddings": embeddings, "count": len(embeddings)}
 
 # ===============================
 # Sarvam Translation
@@ -669,4 +773,10 @@ async def qwen_caption(file: UploadFile = File(...), prompt: str = Form(QWEN_DEF
 @app.get("/health")
 def health():
     status = get_runtime_model_status()
-    return {"status": "ok", "service": "main-inference", **status}
+    return {
+        "status": "ok",
+        "service": "main-inference",
+        "instance": INSTANCE_NAME,
+        "inflight_requests": INFLIGHT_REQUESTS,
+        **status,
+    }
