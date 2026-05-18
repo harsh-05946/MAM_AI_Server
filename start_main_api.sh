@@ -3,14 +3,14 @@
 
 set -euo pipefail
 
-cd /home/ubuntu/app || exit 1
-source /home/ubuntu/app/venv/bin/activate
+cd /home/ubuntu/MAM_AI_Server || exit 1
+source /home/ubuntu/MAM_AI_Server/.venv/bin/activate
 
 export CUDA_VISIBLE_DEVICES=0
 HOST=${HOST:-0.0.0.0}
 PORT=${PORT:-8000}
-LOG_FILE=/home/ubuntu/app/main_api.log
-PID_FILE=/home/ubuntu/app/main_api.pid
+LOG_FILE=/home/ubuntu/MAM_AI_Server/main_api.log
+PID_FILE=/home/ubuntu/MAM_AI_Server/main_api.pid
 
 # Online-by-default for simple HF cache flow (opt-in offline).
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}

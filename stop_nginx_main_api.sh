@@ -2,7 +2,7 @@
 # app/stop_nginx_main_api.sh
 set -euo pipefail
 
-RUN_DIR=/home/ubuntu/app/nginx-run
+RUN_DIR=/home/ubuntu/MAM_AI_Server/nginx-run
 PID_FILE=${RUN_DIR}/nginx.pid
 
 if [ ! -f "${PID_FILE}" ]; then

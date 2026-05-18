@@ -1,185 +1,0 @@
-Starting Main Inference API A on port 8001...
-Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.7.1+cu118).
-INFO:     Started server process [2172]
-INFO:     Waiting for application startup.
-2026-05-15 05:22:28,969 [INFO] 🚀 Starting Main Inference Service
-2026-05-15 05:22:28,969 [INFO] 📦 Loading InsightFace...
-2026-05-15 05:22:29,736 [INFO] ✅ InsightFace loaded on cuda
-2026-05-15 05:22:29,737 [INFO] 📦 Loading Emotion model...
-2026-05-15 05:22:29,737 [INFO] 📍 emotion: using hub id 'trpakov/vit-face-expression'
-2026-05-15 05:22:29,804 [INFO] HTTP Request: HEAD https://huggingface.co/trpakov/vit-face-expression/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:29,840 [INFO] HTTP Request: HEAD https://huggingface.co/trpakov/vit-face-expression/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:29,847 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/trpakov/vit-face-expression/ef0bc6fc34241b6587e7e009e7711357be28c024/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:29,884 [INFO] HTTP Request: HEAD https://huggingface.co/trpakov/vit-face-expression/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:29,924 [INFO] HTTP Request: HEAD https://huggingface.co/trpakov/vit-face-expression/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:29,932 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/trpakov/vit-face-expression/ef0bc6fc34241b6587e7e009e7711357be28c024/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:29,972 [INFO] HTTP Request: HEAD https://huggingface.co/trpakov/vit-face-expression/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:29,980 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/trpakov/vit-face-expression/ef0bc6fc34241b6587e7e009e7711357be28c024/config.json "HTTP/1.1 200 OK"
-Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
-find model: /home/ubuntu/.insightface/models/buffalo_l/1k3d68.onnx landmark_3d_68 ['None', 3, 192, 192] 0.0 1.0
-Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
-find model: /home/ubuntu/.insightface/models/buffalo_l/2d106det.onnx landmark_2d_106 ['None', 3, 192, 192] 0.0 1.0
-Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
-find model: /home/ubuntu/.insightface/models/buffalo_l/det_10g.onnx detection [1, 3, '?', '?'] 127.5 128.0
-Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
-find model: /home/ubuntu/.insightface/models/buffalo_l/genderage.onnx genderage ['None', 3, 96, 96] 0.0 1.0
-Applied providers: ['CPUExecutionProvider'], with options: {'CPUExecutionProvider': {}}
-find model: /home/ubuntu/.insightface/models/buffalo_l/w600k_r50.onnx recognition ['None', 3, 112, 112] 127.5 127.5
-set det-size: (640, 640)
-Loading weights:   0%|          | 0/200 [00:00<?, ?it/s]Loading weights: 100%|██████████| 200/200 [00:00<00:00, 5163.84it/s]
-2026-05-15 05:22:30,217 [INFO] 📦 Loading BLIP scene model...
-2026-05-15 05:22:30,217 [INFO] 📍 scene: using hub id 'Salesforce/blip-image-captioning-large'
-2026-05-15 05:22:30,257 [INFO] HTTP Request: GET https://huggingface.co/api/models/Salesforce/blip-image-captioning-large/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:30,296 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:30,335 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/chat_template.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:30,367 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/chat_template.jinja "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:30,400 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/audio_tokenizer_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:30,431 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:30,464 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:30,470 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Salesforce/blip-image-captioning-large/353689b859fcf0523410b1806dace5fb46ecdf41/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:30,502 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:30,532 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:30,539 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Salesforce/blip-image-captioning-large/353689b859fcf0523410b1806dace5fb46ecdf41/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:30,575 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:30,581 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Salesforce/blip-image-captioning-large/353689b859fcf0523410b1806dace5fb46ecdf41/config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:30,621 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:30,627 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Salesforce/blip-image-captioning-large/353689b859fcf0523410b1806dace5fb46ecdf41/tokenizer_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:30,658 [INFO] HTTP Request: GET https://huggingface.co/api/models/Salesforce/blip-image-captioning-large/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:30,691 [INFO] HTTP Request: GET https://huggingface.co/api/models/Salesforce/blip-image-captioning-large/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
-2026-05-15 05:22:30,770 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:30,779 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Salesforce/blip-image-captioning-large/353689b859fcf0523410b1806dace5fb46ecdf41/config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:30,824 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/model.safetensors "HTTP/1.1 302 Found"
-Loading weights:   0%|          | 0/616 [00:00<?, ?it/s]Loading weights:  45%|████▍     | 275/616 [00:00<00:00, 2748.45it/s]Loading weights: 100%|██████████| 616/616 [00:00<00:00, 5069.84it/s]
-[1mBlipForConditionalGeneration LOAD REPORT[0m from: Salesforce/blip-image-captioning-large
-Key                                       | Status     |  | 
-------------------------------------------+------------+--+-
-text_decoder.bert.embeddings.position_ids | UNEXPECTED |  | 
-
-Notes:
-- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
-2026-05-15 05:22:31,157 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/generation_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:31,192 [INFO] HTTP Request: HEAD https://huggingface.co/Salesforce/blip-image-captioning-large/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:31,200 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Salesforce/blip-image-captioning-large/353689b859fcf0523410b1806dace5fb46ecdf41/config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:31,487 [INFO] 📦 Loading RAM++ model (Object Detection)...
-2026-05-15 05:22:33,538 [INFO] HTTP Request: HEAD https://huggingface.co/bert-base-uncased/resolve/main/tokenizer_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:33,569 [INFO] HTTP Request: GET https://huggingface.co/api/models/bert-base-uncased/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:33,602 [INFO] HTTP Request: GET https://huggingface.co/api/models/google-bert/bert-base-uncased/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:33,637 [INFO] HTTP Request: GET https://huggingface.co/api/models/bert-base-uncased/tree/main?recursive=true&expand=false "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:33,673 [INFO] HTTP Request: GET https://huggingface.co/api/models/google-bert/bert-base-uncased/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
-The new embeddings will be initialized from a multivariate normal distribution that has old embeddings' mean and covariance. As described in this article: https://nlp.stanford.edu/~johnhew/vocab-expansion.html. To disable this, use `mean_resizing=False`
-2026-05-15 05:22:36,011 [INFO] 📦 Loading SentenceTransformer...
-2026-05-15 05:22:36,011 [INFO] 📍 embed: using hub id 'sentence-transformers/all-MiniLM-L6-v2'
-2026-05-15 05:22:36,011 [INFO] Load pretrained SentenceTransformer: sentence-transformers/all-MiniLM-L6-v2
-2026-05-15 05:22:36,049 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/modules.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,056 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/modules.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,088 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config_sentence_transformers.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,094 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/config_sentence_transformers.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,128 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/README.md "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,134 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/README.md "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,168 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/modules.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,176 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/modules.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,209 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/sentence_bert_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,216 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/sentence_bert_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,245 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,251 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/config.json "HTTP/1.1 200 OK"
---------------
-/home/ubuntu/app/pretrained/ram_plus_swin_large_14m.pth
---------------
-load checkpoint from /home/ubuntu/app/pretrained/ram_plus_swin_large_14m.pth
-vit: swin_l
-Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 5855.27it/s]
-[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
-Key                     | Status     |  | 
-------------------------+------------+--+-
-embeddings.position_ids | UNEXPECTED |  | 
-
-Notes:
-- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
-2026-05-15 05:22:36,347 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,354 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,385 [INFO] HTTP Request: HEAD https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,392 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sentence-transformers/all-MiniLM-L6-v2/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/tokenizer_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,428 [INFO] HTTP Request: GET https://huggingface.co/api/models/sentence-transformers/all-MiniLM-L6-v2/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:36,466 [INFO] HTTP Request: GET https://huggingface.co/api/models/sentence-transformers/all-MiniLM-L6-v2/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,535 [INFO] HTTP Request: GET https://huggingface.co/api/models/sentence-transformers/all-MiniLM-L6-v2/revision/main "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,559 [INFO] ✅ SentenceTransformer loaded on cuda
-2026-05-15 05:22:36,559 [INFO] 📦 Loading Sarvam translation model...
-2026-05-15 05:22:36,559 [INFO] 📍 sarvam: using hub id 'sarvamai/sarvam-translate'
-2026-05-15 05:22:36,593 [INFO] HTTP Request: HEAD https://huggingface.co/sarvamai/sarvam-translate/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,600 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sarvamai/sarvam-translate/37da6e80728634b661c3cc3ee2a3d9fa33ae9150/config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,663 [INFO] HTTP Request: HEAD https://huggingface.co/sarvamai/sarvam-translate/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:36,673 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sarvamai/sarvam-translate/37da6e80728634b661c3cc3ee2a3d9fa33ae9150/tokenizer_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:36,730 [INFO] HTTP Request: GET https://huggingface.co/api/models/sarvamai/sarvam-translate/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:36,767 [INFO] HTTP Request: GET https://huggingface.co/api/models/sarvamai/sarvam-translate/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
-2026-05-15 05:22:38,614 [INFO] HTTP Request: GET https://huggingface.co/api/models/sarvamai/sarvam-translate "HTTP/1.1 200 OK"
-2026-05-15 05:22:38,651 [INFO] HTTP Request: HEAD https://huggingface.co/sarvamai/sarvam-translate/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:38,659 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sarvamai/sarvam-translate/37da6e80728634b661c3cc3ee2a3d9fa33ae9150/config.json "HTTP/1.1 200 OK"
-`torch_dtype` is deprecated! Use `dtype` instead!
-Loading weights:   0%|          | 0/883 [00:00<?, ?it/s]Loading weights:   0%|          | 1/883 [00:00<01:48,  8.12it/s]Loading weights:   5%|▍         | 43/883 [00:00<00:03, 223.77it/s]Loading weights:  11%|█         | 96/883 [00:00<00:02, 348.39it/s]Loading weights:  17%|█▋        | 153/883 [00:00<00:01, 430.76it/s]Loading weights:  23%|██▎       | 206/883 [00:00<00:01, 465.24it/s]Loading weights:  29%|██▉       | 260/883 [00:00<00:01, 488.69it/s]Loading weights:  35%|███▌      | 313/883 [00:00<00:01, 500.73it/s]Loading weights:  42%|████▏     | 367/883 [00:00<00:01, 505.77it/s]Loading weights:  48%|████▊     | 420/883 [00:00<00:00, 505.60it/s]Loading weights:  65%|██████▌   | 577/883 [00:01<00:00, 825.79it/s]Loading weights:  89%|████████▉ | 787/883 [00:01<00:00, 1208.98it/s]Loading weights: 100%|██████████| 883/883 [00:01<00:00, 741.45it/s] 
-2026-05-15 05:22:41,903 [INFO] HTTP Request: HEAD https://huggingface.co/sarvamai/sarvam-translate/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:41,909 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/sarvamai/sarvam-translate/37da6e80728634b661c3cc3ee2a3d9fa33ae9150/generation_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:41,914 [INFO] ✅ Sarvam loaded on cuda (4bit=True, compute_dtype=torch.bfloat16)
-2026-05-15 05:22:41,914 [INFO] 📦 Loading Qwen2.5-VL model...
-2026-05-15 05:22:41,914 [INFO] 📍 qwen_vl: using hub id 'Qwen/Qwen2.5-VL-3B-Instruct'
-2026-05-15 05:22:41,948 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:41,983 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:41,989 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:42,031 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:42,062 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:42,070 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:42,101 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2.5-VL-3B-Instruct/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:42,144 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:42,183 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/chat_template.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:42,189 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/chat_template.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:42,223 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/chat_template.jinja "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:42,256 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/audio_tokenizer_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:42,289 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:42,323 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:42,332 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:42,380 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:42,416 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:42,422 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:42,455 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:42,461 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:42,513 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:42,519 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/tokenizer_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:42,577 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2.5-VL-3B-Instruct/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:42,612 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2.5-VL-3B-Instruct/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
-2026-05-15 05:22:42,971 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2.5-VL-3B-Instruct "HTTP/1.1 200 OK"
-2026-05-15 05:22:43,005 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:43,039 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/video_preprocessor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:43,068 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:43,074 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:43,106 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:43,141 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/video_preprocessor_config.json "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:43,169 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:43,175 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:43,208 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:43,216 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:43,264 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/model.safetensors "HTTP/1.1 404 Not Found"
-2026-05-15 05:22:43,296 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/model.safetensors.index.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:43,303 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/model.safetensors.index.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:43,339 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2.5-VL-3B-Instruct/revision/main "HTTP/1.1 200 OK"
-Fetching 2 files:   0%|          | 0/2 [00:00<?, ?it/s]Fetching 2 files: 100%|██████████| 2/2 [00:00<00:00, 19831.22it/s]
-Loading weights:   0%|          | 0/824 [00:00<?, ?it/s]Loading weights:   2%|▏         | 16/824 [00:00<00:05, 155.86it/s]Loading weights:   9%|▉         | 75/824 [00:00<00:01, 405.65it/s]Loading weights:  16%|█▌        | 131/824 [00:00<00:01, 474.53it/s]Loading weights:  22%|██▏       | 185/824 [00:00<00:01, 494.59it/s]Loading weights:  29%|██▉       | 243/824 [00:00<00:01, 515.26it/s]Loading weights:  36%|███▌      | 295/824 [00:00<00:01, 502.75it/s]Loading weights:  43%|████▎     | 351/824 [00:00<00:00, 517.81it/s]Loading weights:  49%|████▉     | 403/824 [00:00<00:00, 513.43it/s]Loading weights:  63%|██████▎   | 520/824 [00:00<00:00, 713.16it/s]Loading weights:  83%|████████▎ | 680/824 [00:01<00:00, 981.57it/s]Loading weights: 100%|██████████| 824/824 [00:01<00:00, 734.08it/s]
-2026-05-15 05:22:45,228 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-05-15 05:22:45,235 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2.5-VL-3B-Instruct/66285546d2b821cf421d4f5eb2576359d3770cd3/generation_config.json "HTTP/1.1 200 OK"
-2026-05-15 05:22:45,239 [INFO] ✅ Qwen2.5-VL loaded on cuda (4bit=True, compute_dtype=torch.bfloat16)
-2026-05-15 05:22:45,239 [INFO] ✅ Main models loading sequence complete
-2026-05-15 05:22:45,239 [INFO] ⚡ Micro-batching enabled for emotion (max_batch=16, wait_ms=8)
-2026-05-15 05:22:45,239 [INFO] ⚡ Micro-batching enabled for scene (max_batch=8, wait_ms=10)
-2026-05-15 05:22:45,239 [INFO] ⚡ Micro-batching enabled for ram_plus (max_batch=8, wait_ms=10)
-2026-05-15 05:22:45,239 [INFO] ⚡ Micro-batching enabled for face (max_batch=4, wait_ms=8)
-2026-05-15 05:22:45,240 [INFO] ⚡ Micro-batching enabled for embed (max_batch=32, wait_ms=8)
-2026-05-15 05:22:45,240 [INFO] ✅ Main models loaded in 16.27s
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
-ERROR:    Traceback (most recent call last):
-  File "/home/ubuntu/app/venv/lib/python3.10/site-packages/starlette/routing.py", line 743, in lifespan
-    await receive()
-  File "/home/ubuntu/app/venv/lib/python3.10/site-packages/uvicorn/lifespan/on.py", line 137, in receive
-    return await self.receive_queue.get()
-  File "/opt/conda/lib/python3.10/asyncio/queues.py", line 159, in get
-    await getter
-asyncio.exceptions.CancelledError
-

@@ -3,8 +3,8 @@
 
 set -euo pipefail
 
-cd /home/ubuntu/app || exit 1
-source /home/ubuntu/app/venv/bin/activate
+cd /home/ubuntu/MAM_AI_Server || exit 1
+source /home/ubuntu/MAM_AI_Server/.venv/bin/activate
 
 HOST=${HOST:-0.0.0.0}
 PORT=${PORT:-9000}

@@ -1,6 +1,6 @@
 #!/bin/bash
 # app/status_main_api.sh
-PID_FILE=/home/ubuntu/app/main_api.pid
+PID_FILE=/home/ubuntu/MAM_AI_Server/main_api.pid
 
 if pgrep -f "uvicorn main:app" > /dev/null; then
   echo "✅ Main Inference API is RUNNING."

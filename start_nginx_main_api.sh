@@ -3,10 +3,10 @@
 
 set -euo pipefail
 
-cd /home/ubuntu/app || exit 1
+cd /home/ubuntu/MAM_AI_Server || exit 1
 
-CONF=/home/ubuntu/app/nginx_main_api.conf
-RUN_DIR=/home/ubuntu/app/nginx-run
+CONF=/home/ubuntu/MAM_AI_Server/nginx_main_api.conf
+RUN_DIR=/home/ubuntu/MAM_AI_Server/nginx-run
 PID_FILE=${RUN_DIR}/nginx.pid
 
 mkdir -p "${RUN_DIR}"

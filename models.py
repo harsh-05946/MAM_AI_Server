@@ -8,10 +8,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from insightface.app import FaceAnalysis
-from ram import get_transform, inference_ram
-from ram.models import ram_plus
-from sentence_transformers import SentenceTransformer
 from transformers import (
     AutoImageProcessor,
     AutoModelForImageClassification,
@@ -25,6 +21,38 @@ from transformers import (
     BlipProcessor,
     Qwen2_5_VLForConditionalGeneration,
 )
+
+
+def _patch_transformers_for_ram() -> None:
+    """RAM's vendored BERT still imports helpers removed/moved in transformers v5."""
+    import transformers.modeling_utils as modeling_utils
+    from transformers import pytorch_utils
+
+    if not hasattr(modeling_utils, "apply_chunking_to_forward"):
+        modeling_utils.apply_chunking_to_forward = pytorch_utils.apply_chunking_to_forward
+    if not hasattr(modeling_utils, "prune_linear_layer"):
+        modeling_utils.prune_linear_layer = pytorch_utils.prune_linear_layer
+    if not hasattr(modeling_utils, "find_pruneable_heads_and_indices"):
+
+        def find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+            mask = torch.ones(n_heads, head_size)
+            heads = set(heads) - already_pruned_heads
+            for head in heads:
+                head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+                mask[head] = 0
+            mask = mask.view(-1).contiguous().eq(1)
+            index = torch.arange(len(mask))[mask].long()
+            return heads, index
+
+        modeling_utils.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+
+
+_patch_transformers_for_ram()
+
+from insightface.app import FaceAnalysis
+from ram import get_transform, inference_ram
+from ram.models import ram_plus
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 

@@ -21,30 +21,46 @@ htmlcov/
 coverage.xml
 *.cover
 
-# --- Secrets / local env (keep .env.example tracked with ! if you add one) ---
+# uv (lockfile is tracked; local cache is not)
+.uv/
+
+# --- Secrets / local env ---
 .env
 .env.*
 !.env.example
 
-# --- ML weights & caches (heavy) ---
+# --- ML weights & caches (large; download via bootstrap_local_models.py) ---
 pretrained/
 models-local/
 .cache/
 **/.huggingface/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
 
-# Common local weight / export extensions under the repo (uncomment if you never commit these)
-# *.onnx
-# *.pt
-# *.pth
-# *.bin
-# *.safetensors
-# *.ckpt
+# InsightFace downloads to home dir by default; ignore if copied locally
+.insightface/
 
-# --- Runtime logs & PIDs ---
+# --- Runtime: logs, PIDs, process output ---
 *.log
 *.pid
-nginx-run/*.log
-nginx-run/nginx.pid
+nohup.out
+nginx-run/
+
+# --- Local test / sample media (not needed in repo) ---
+*.mp3
+*.m4a
+*.wav
+*.flac
+/test*.jpg
+/test*.jpeg
+/test*.png
+/trump_*.mp3
+/videoplayback.*
+/maxresdefault.jpg
 
 # --- OS / editor ---
 .DS_Store
@@ -52,6 +68,8 @@ Thumbs.db
 *.swp
 *.swo
 .idea/
+.vscode/
+.cursor/
 
 # --- Experiments / tooling output ---
 wandb/
