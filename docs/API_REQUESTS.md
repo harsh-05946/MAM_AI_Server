@@ -23,8 +23,8 @@ Unless noted, responses are JSON.
 | Mode | Content-Type | Body |
 |------|----------------|------|
 | Single (HTTP) | `multipart/form-data` | One part: form field **`file`** (image: jpeg/png/webp, etc.). |
-| Batch (HTTP) | — | **Not implemented.** One image per request. |
-| Micro-batch (server) | — | If `BATCHING_ENABLED=true`, concurrent face requests may be grouped (default `BATCH_MAX_FACE=4`, `BATCH_WAIT_MS_FACE=8`). Each image still runs `model.get()` sequentially inside the batch worker. |
+| Batch (HTTP) | — | Use **`POST /process/face/batch`** (below). |
+| Micro-batch (server) | — | If `BATCHING_ENABLED=true`, concurrent face requests may be grouped (default `BATCH_MAX_FACE=8`, `BATCH_WAIT_MS_FACE=8`). Each image still runs `model.get()` sequentially inside the batch worker. |
 
 **Example (curl, single):**
 
@@ -34,6 +34,33 @@ curl -sS -X POST "http://127.0.0.1:8001/process/face" \
 ```
 
 **Response:** JSON array of `{ "bbox": [...], "embedding": [...] }` (one entry per detected face in that image).
+
+---
+
+## `POST /process/face/batch`
+
+| Mode | Content-Type | Body |
+|------|----------------|------|
+| Batch (HTTP) | `multipart/form-data` | Repeat form field **`files`** for each image. Max count: **`FACE_BATCH_MAX`** (default `8`). |
+
+Runs sequential InsightFace `get()` per image (one HTTP round-trip; not a single ONNX batch). Order of parts = order of results.
+
+**Example (curl):**
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8001/process/face/batch" \
+  -F "files=@/path/to/a.jpg" \
+  -F "files=@/path/to/b.jpg"
+```
+
+**Response:** JSON array, one object per image:
+
+```json
+[
+  {"filename": "a.jpg", "faces": [{"bbox": [...], "embedding": [...]}]},
+  {"filename": "b.jpg", "faces": []}
+]
+```
 
 ---
 
@@ -79,7 +106,7 @@ curl -sS -X POST "http://127.0.0.1:8001/process/emotion/batch" \
 | Mode | Content-Type | Body |
 |------|----------------|------|
 | Single (HTTP) | `multipart/form-data` | Form field **`file`**. |
-| Batch (HTTP) | — | **Not implemented** (one image per request). |
+| Batch (HTTP) | — | Use **`POST /process/scene/batch`** (below). |
 | Micro-batch (server) | — | `BATCH_MAX_SCENE`, `BATCH_WAIT_MS_SCENE` (defaults 8 / 10 ms). |
 
 **Example (curl):**
@@ -93,12 +120,32 @@ curl -sS -X POST "http://127.0.0.1:8001/process/scene" \
 
 ---
 
+## `POST /process/scene/batch`
+
+| Mode | Content-Type | Body |
+|------|----------------|------|
+| Batch (HTTP) | `multipart/form-data` | Repeat form field **`files`** for each image. Max count: **`SCENE_BATCH_MAX`** (default `8`). |
+
+One BLIP `generate` for all images. Order of parts = order of results.
+
+**Example (curl):**
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8001/process/scene/batch" \
+  -F "files=@/path/to/a.jpg" \
+  -F "files=@/path/to/b.jpg"
+```
+
+**Response:** JSON array of `{ "scene", "filename"? }`.
+
+---
+
 ## `POST /process/object-detection` (RAM++)
 
 | Mode | Content-Type | Body |
 |------|----------------|------|
 | Single (HTTP) | `multipart/form-data` | Form field **`file`**. |
-| Batch (HTTP) | — | **Not implemented** (one image per request). |
+| Batch (HTTP) | — | Use **`POST /process/object-detection/batch`** (below). |
 | Micro-batch (server) | — | `BATCH_MAX_RAM_PLUS`, `BATCH_WAIT_MS_RAM_PLUS` (defaults 8 / 10 ms). |
 
 **Example (curl):**
@@ -109,6 +156,26 @@ curl -sS -X POST "http://127.0.0.1:8001/process/object-detection" \
 ```
 
 **Response:** `{ "tags_en": ..., "tags_cn": ... }` (shape depends on RAM++ output for that image).
+
+---
+
+## `POST /process/object-detection/batch`
+
+| Mode | Content-Type | Body |
+|------|----------------|------|
+| Batch (HTTP) | `multipart/form-data` | Repeat form field **`files`** for each image. Max count: **`RAM_BATCH_MAX`** (default `8`). |
+
+One RAM++ forward when the runtime supports batched tensors; otherwise per-image fallback inside the worker. Order of parts = order of results.
+
+**Example (curl):**
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8001/process/object-detection/batch" \
+  -F "files=@/path/to/a.jpg" \
+  -F "files=@/path/to/b.jpg"
+```
+
+**Response:** JSON array of `{ "tags_en", "tags_cn", "filename"? }`.
 
 ---
 
@@ -147,7 +214,8 @@ curl -sS -X POST "http://127.0.0.1:8001/process/embeddings" \
 | Mode | Content-Type | Body |
 |------|----------------|------|
 | Single (HTTP) | `application/json` | `{ "text": "<source text>", "target_lang": "Hindi" }` — `target_lang` may be a key from the server map (e.g. `hindi`) or a display name; see `SUPPORTED_LANGUAGES` in `main.py`. |
-| Batch (HTTP) | — | **Not implemented** (one `text` per request). |
+| Batch (HTTP) | — | Use **`POST /process/translation/sarvam/batch`** (below). |
+| Micro-batch (server) | — | Concurrent single-text Sarvam requests with the **same** `target_lang` may merge (`BATCH_MAX_SARVAM`, `BATCH_WAIT_MS_SARVAM`; defaults 10 / 10 ms). |
 
 **Example (curl):**
 
@@ -161,11 +229,33 @@ curl -sS -X POST "http://127.0.0.1:8001/process/translation/sarvam" \
 
 ---
 
+## `POST /process/translation/sarvam/batch`
+
+| Mode | Content-Type | Body |
+|------|----------------|------|
+| Batch (HTTP) | `application/json` | `{ "texts": ["...", "..."], "target_lang": "hindi" }` — shared target language for all strings. |
+
+Runs **one or two batched** Sarvam `generate` calls on the GPU (pass 2 only for rows that need Latin-script recovery). Max strings per request: **`SARVAM_BATCH_MAX`** (default **10**).
+
+**Example (curl):**
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8001/process/translation/sarvam/batch" \
+  -H "Content-Type: application/json" \
+  -d '{"texts":["Hello","Good morning"],"target_lang":"hindi"}'
+```
+
+**Response:** `{ "translated_texts": ["...", "..."], "target_lang": "...", "engine": "sarvam", "count": <int> }`
+
+---
+
 ## `POST /process/caption/qwen`
 
 | Mode | Content-Type | Body |
 |------|----------------|------|
 | Single (HTTP) | `multipart/form-data` | **`file`**: image. **`prompt`**: form field (string); optional, defaults to built-in OCR-style prompt in code. |
+| Batch (HTTP) | — | Use **`POST /process/caption/qwen/batch`** (below). |
+| Micro-batch (server) | — | Concurrent single-image Qwen requests with the **same** prompt may merge (`BATCH_MAX_QWEN`, `BATCH_WAIT_MS_QWEN`; defaults 10 / 10 ms). |
 
 **Example (curl):**
 
@@ -176,6 +266,34 @@ curl -sS -X POST "http://127.0.0.1:8001/process/caption/qwen" \
 ```
 
 **Response:** `{ "caption": "...", "model": "...", "prompt_used": "...", "duration_sec": ... }`
+
+---
+
+## `POST /process/caption/qwen/batch`
+
+| Mode | Content-Type | Body |
+|------|----------------|------|
+| Batch (HTTP) | `multipart/form-data` | Repeat form field **`files`** for each image (one shared **`prompt`** for all). |
+
+Runs **one batched** Qwen2.5-VL `generate` on the GPU (not micro-batching). Max images per request: **`QWEN_BATCH_MAX`** (default **10**).
+
+**Example (curl):**
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8001/process/caption/qwen/batch" \
+  -F "files=@/path/to/a.jpg" \
+  -F "files=@/path/to/b.jpg" \
+  -F "prompt=Extract all text present in the image."
+```
+
+**Response:** JSON array, one object per image (order matches uploads):
+
+```json
+[
+  {"caption": "...", "filename": "a.jpg", "model": "...", "prompt_used": "..."},
+  {"caption": "...", "filename": "b.jpg", "model": "...", "prompt_used": "..."}
+]
+```
 
 ---
 
@@ -197,11 +315,20 @@ When `BATCHING_ENABLED` is true (default), these affect **server-side** merging 
 | `BATCH_WAIT_MS_SCENE` | 10 | scene |
 | `BATCH_MAX_RAM_PLUS` | 8 | object-detection |
 | `BATCH_WAIT_MS_RAM_PLUS` | 10 | object-detection |
-| `BATCH_MAX_FACE` | 4 | face |
+| `BATCH_MAX_FACE` | 8 | face |
 | `BATCH_WAIT_MS_FACE` | 8 | face |
+| `BATCH_MAX_QWEN` | 10 | Qwen single-image (prompt-aware micro-batch) |
+| `BATCH_WAIT_MS_QWEN` | 10 | Qwen single-image |
+| `BATCH_MAX_SARVAM` | 10 | Sarvam single-text (target_lang-aware micro-batch) |
+| `BATCH_WAIT_MS_SARVAM` | 10 | Sarvam single-text |
 | `BATCH_MAX_EMBED` | 32 | embeddings (single-text requests only) |
 | `BATCH_WAIT_MS_EMBED` | 8 | embeddings |
 | `EMOTION_BATCH_MAX` | 32 | max images per `POST /process/emotion/batch` |
+| `SCENE_BATCH_MAX` | 8 | max images per `POST /process/scene/batch` |
+| `RAM_BATCH_MAX` | 8 | max images per `POST /process/object-detection/batch` |
+| `FACE_BATCH_MAX` | 8 | max images per `POST /process/face/batch` |
+| `QWEN_BATCH_MAX` | 10 | max images per `POST /process/caption/qwen/batch` (real GPU batch; not micro-batch) |
+| `SARVAM_BATCH_MAX` | 10 | max strings per `POST /process/translation/sarvam/batch` (real GPU batch; not micro-batch) |
 
 Set `BATCHING_ENABLED=false` to disable micro-batching (each request runs immediately alone).
 

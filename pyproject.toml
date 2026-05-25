@@ -19,7 +19,7 @@ dependencies = [
     "pydantic>=2.12,<3",
     "python-dotenv==1.2.2",
     "python-multipart==0.0.22",
-    "qwen-vl-utils>=0.0.8",
+    "qwen-vl-utils[decord]==0.0.8",
     "ram",
     "requests>=2.33",
     "safetensors>=0.7",
