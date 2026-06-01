@@ -761,6 +761,7 @@ async def face_recognition_batch(
         out.append(item)
     return out
 
+
 # ===============================
 # Emotion Detection
 # ===============================
@@ -803,6 +804,7 @@ async def emotion_detection_batch(files: List[UploadFile] = File(..., descriptio
         logger.info(f"😊 Emotion batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
 
     return _attach_filenames(names, results)
+
 
 # ===============================
 # Scene Description
@@ -848,6 +850,7 @@ async def scene_description_batch(
         logger.info(f"🖼️ Scene batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
 
     return _attach_filenames(names, results)
+
 
 # ===============================
 # Object Detection (RAM++)
@@ -900,6 +903,7 @@ async def object_detection_batch(
         logger.info(f"🏷️ RAM++ batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
 
     return _attach_filenames(names, results)
+
 
 # ===============================
 # Text Embeddings
@@ -1103,6 +1107,7 @@ async def qwen_caption_batch(
         out.append(item)
     return out
 
+
 @app.get("/health")
 def health():
     status = get_runtime_model_status()
@@ -1113,3 +1118,4 @@ def health():
         "inflight_requests": INFLIGHT_REQUESTS,
         **status,
     }
+

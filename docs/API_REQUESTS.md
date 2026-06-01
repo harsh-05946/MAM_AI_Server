@@ -303,6 +303,24 @@ No body. Returns service status, loaded model keys, and optional CUDA memory sta
 
 ---
 
+## Retest with same URLs (2x batch limits)
+
+If you want to keep the exact same endpoint URLs and only increase per-request batch capacity for testing, start the same app with:
+
+```bash
+bash ./start_main_api_2x_batch.sh
+```
+
+This keeps all `/process/...` routes unchanged and doubles only:
+- `FACE_BATCH_MAX`
+- `EMOTION_BATCH_MAX`
+- `SCENE_BATCH_MAX`
+- `RAM_BATCH_MAX`
+- `QWEN_BATCH_MAX`
+- `SARVAM_BATCH_MAX`
+
+---
+
 ## Environment knobs (micro-batching)
 
 When `BATCHING_ENABLED` is true (default), these affect **server-side** merging of **separate** HTTP requests:

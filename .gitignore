@@ -63,6 +63,8 @@ nginx-run/
 /maxresdefault.jpg
 
 # --- OS / editor ---
+*.deb
+*.rpm
 .DS_Store
 Thumbs.db
 *.swp
