@@ -85,6 +85,12 @@ MODELS = {}
 MODEL_LOCKS = {}
 MODELS_LOCK = threading.RLock()
 GPU_LOCK = threading.Lock()
+FACE_PROVIDER_STATUS: dict = {
+    "require_face_cuda": False,
+    "sessions": {},
+    "pass": False,
+    "message": "not_loaded",
+}
 
 QWEN_DEFAULT_MAX_PIXELS = 1024 * 1024
 QWEN_DEFAULT_MIN_PIXELS = 256 * 256
@@ -101,6 +107,8 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 ENABLE_QWEN_4BIT = _bool_env("ENABLE_QWEN_4BIT", True)
 ENABLE_SARVAM_4BIT = _bool_env("ENABLE_SARVAM_4BIT", True)
+REQUIRE_FACE_CUDA = _bool_env("REQUIRE_FACE_CUDA", True)
+ENABLE_CUDNN_BENCHMARK = _bool_env("ENABLE_CUDNN_BENCHMARK", False)
 if QWEN_MIN_PIXELS > QWEN_MAX_PIXELS:
     QWEN_MIN_PIXELS = QWEN_MAX_PIXELS
 
@@ -213,6 +221,7 @@ def get_gpu_lock() -> threading.Lock:
 
 
 def clear_cuda_memory(reason: str = "") -> None:
+    """Only for shutdown / controlled OOM recovery — not routine request paths."""
     try:
         gc.collect()
         if torch.cuda.is_available():
@@ -222,6 +231,89 @@ def clear_cuda_memory(reason: str = "") -> None:
             logger.info(f"🧹 Memory cleanup complete ({reason})")
     except Exception as e:
         logger.warning(f"Memory cleanup warning: {e}")
+
+
+def _preload_ort_cuda_libs() -> None:
+    """Best-effort preload so InsightFace ORT finds matching CUDA 12 libs."""
+    try:
+        import ctypes
+        import onnxruntime as ort
+
+        candidates = []
+        for root in (
+            Path(ort.__file__).resolve().parent,
+            Path(torch.__file__).resolve().parent,
+            Path("/usr/local/cuda/lib64"),
+        ):
+            if root.exists():
+                candidates.extend(root.rglob("libcudnn*.so*"))
+                candidates.extend(root.rglob("libcublas*.so*"))
+        for lib in candidates[:20]:
+            try:
+                ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"ORT CUDA lib preload skipped: {e}")
+
+
+def _inspect_face_providers(face_app) -> dict:
+    sessions = {}
+    all_pass = True
+    models = getattr(face_app, "models", {}) or {}
+    for name, model in models.items():
+        session = getattr(model, "session", None)
+        providers = []
+        try:
+            if session is not None and hasattr(session, "get_providers"):
+                providers = list(session.get_providers())
+        except Exception as e:
+            providers = [f"error:{e}"]
+        first = providers[0] if providers else ""
+        ok = first == "CUDAExecutionProvider"
+        sessions[name] = {"providers": providers, "cuda_first": ok}
+        if not ok:
+            all_pass = False
+    status = {
+        "require_face_cuda": REQUIRE_FACE_CUDA,
+        "sessions": sessions,
+        "pass": bool(sessions) and all_pass,
+        "message": "ok" if (sessions and all_pass) else "cuda_provider_missing",
+    }
+    return status
+
+
+def validate_face_providers(face_app=None) -> dict:
+    global FACE_PROVIDER_STATUS
+    app = face_app if face_app is not None else MODELS.get("face")
+    if app is None:
+        FACE_PROVIDER_STATUS = {
+            "require_face_cuda": REQUIRE_FACE_CUDA,
+            "sessions": {},
+            "pass": False,
+            "message": "face_model_not_loaded",
+        }
+        return FACE_PROVIDER_STATUS
+    FACE_PROVIDER_STATUS = _inspect_face_providers(app)
+    try:
+        from runtime.event_logger import emit
+
+        for name, info in FACE_PROVIDER_STATUS.get("sessions", {}).items():
+            emit(
+                "provider_validation",
+                model="insightface",
+                session=name,
+                providers=info.get("providers"),
+                cuda_first=info.get("cuda_first"),
+                pass_status=FACE_PROVIDER_STATUS.get("pass"),
+            )
+    except Exception:
+        pass
+    return FACE_PROVIDER_STATUS
+
+
+def get_face_provider_status() -> dict:
+    return dict(FACE_PROVIDER_STATUS)
 
 
 def _build_4bit_config(enabled: bool, device: str) -> tuple[Optional[BitsAndBytesConfig], bool]:
@@ -252,13 +344,21 @@ def get_device_info():
                 torch.backends.cuda.enable_math_sdp(True)
         except Exception as e:
             logger.warning(f"Unable to set SDPA backend preferences: {e}")
+    if device == "cuda" and hasattr(torch.backends, "cudnn"):
+        try:
+            torch.backends.cudnn.benchmark = ENABLE_CUDNN_BENCHMARK
+        except Exception as e:
+            logger.warning(f"Unable to set cudnn.benchmark: {e}")
 
     return device, torch_dtype
 
 
 def load_main_models():
     """Load models for the main inference service (non-ASR)."""
+    from runtime.event_logger import emit
+
     device, torch_dtype = get_device_info()
+    emit("model_load_started", device=device)
 
     with MODELS_LOCK:
         try:
@@ -268,19 +368,43 @@ def load_main_models():
                         "❌ InsightFace not loaded: GPU-only mode requires CUDA "
                         "(torch.cuda.is_available() is False)"
                     )
+                    emit("model_load_failed", model="insightface", reason="cuda_unavailable")
                 else:
                     logger.info("📦 Loading InsightFace (GPU-only)...")
-                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                    _preload_ort_cuda_libs()
+                    cuda_options = {
+                        "device_id": 0,
+                        "arena_extend_strategy": "kNextPowerOfTwo",
+                        "gpu_mem_limit": 2 * 1024 * 1024 * 1024,
+                        "cudnn_conv_algo_search": "EXHAUSTIVE",
+                        "do_copy_in_default_stream": True,
+                    }
+                    providers = [
+                        ("CUDAExecutionProvider", cuda_options),
+                        "CPUExecutionProvider",
+                    ]
                     try:
                         face_app = FaceAnalysis(name="buffalo_l", providers=providers)
                     except TypeError:
                         # Older insightface builds may not accept 'providers='.
                         face_app = FaceAnalysis(name="buffalo_l")
                     face_app.prepare(ctx_id=0, det_size=(640, 640))
+                    status = validate_face_providers(face_app)
+                    if REQUIRE_FACE_CUDA and not status.get("pass"):
+                        raise RuntimeError(
+                            "REQUIRE_FACE_CUDA=true but InsightFace sessions are not on "
+                            f"CUDAExecutionProvider: {status}"
+                        )
                     MODELS["face"] = face_app
-                    logger.info("✅ InsightFace loaded on cuda (GPU-only)")
+                    logger.info(
+                        f"✅ InsightFace loaded on cuda (provider_pass={status.get('pass')})"
+                    )
+                    emit("model_loaded", model="insightface", provider_pass=status.get("pass"))
         except Exception as e:
             logger.error(f"❌ Failed to load InsightFace: {e}")
+            emit("model_load_failed", model="insightface", error=str(e))
+            if REQUIRE_FACE_CUDA:
+                raise
 
         try:
             if "emotion" not in MODELS:
@@ -289,9 +413,12 @@ def load_main_models():
                 _log_model_source("emotion", source, is_local)
                 emo_processor = AutoImageProcessor.from_pretrained(source, **_hf_kwargs())
                 emo_model = AutoModelForImageClassification.from_pretrained(source, **_hf_kwargs()).to(device)
+                emo_model.eval()
                 MODELS["emotion"] = {"processor": emo_processor, "model": emo_model}
+                emit("model_loaded", model="emotion", source=source, local=is_local)
         except Exception as e:
             logger.error(f"❌ Failed to load Emotion model: {e}")
+            emit("model_load_failed", model="emotion", error=str(e))
 
         try:
             if "scene" not in MODELS:
@@ -300,9 +427,12 @@ def load_main_models():
                 _log_model_source("scene", source, is_local)
                 blip_processor = BlipProcessor.from_pretrained(source, **_hf_kwargs())
                 blip_model = BlipForConditionalGeneration.from_pretrained(source, **_hf_kwargs()).to(device)
+                blip_model.eval()
                 MODELS["scene"] = {"processor": blip_processor, "model": blip_model}
+                emit("model_loaded", model="scene", source=source, local=is_local)
         except Exception as e:
             logger.error(f"❌ Failed to load BLIP model: {e}")
+            emit("model_load_failed", model="scene", error=str(e))
 
         try:
             if "ram_plus" not in MODELS:
@@ -314,8 +444,10 @@ def load_main_models():
                     "transform": ram_plus_transform,
                     "device": device,
                 }
+                emit("model_loaded", model="ram_plus")
         except Exception as e:
             logger.warning(f"⚠️ RAM++ model failed to load (skipping): {e}")
+            emit("model_load_failed", model="ram_plus", error=str(e))
 
         try:
             if "embed" not in MODELS:
@@ -325,8 +457,10 @@ def load_main_models():
                 st_device = "cuda" if device == "cuda" else "cpu"
                 MODELS["embed"] = SentenceTransformer(source, device=st_device)
                 logger.info(f"✅ SentenceTransformer loaded on {st_device}")
+                emit("model_loaded", model="embed", source=source, local=is_local)
         except Exception as e:
             logger.error(f"❌ Failed to load SentenceTransformer: {e}")
+            emit("model_load_failed", model="embed", error=str(e))
 
         try:
             if "sarvam" not in MODELS:
@@ -362,8 +496,10 @@ def load_main_models():
                     "compute_dtype": str(sarvam_dtype),
                 }
                 logger.info(f"✅ Sarvam loaded on {device} (4bit={sarvam_quant_enabled}, compute_dtype={sarvam_dtype})")
+                emit("model_loaded", model="sarvam", quantized_4bit=sarvam_quant_enabled)
         except Exception as e:
             logger.error(f"❌ Failed to load Sarvam model: {e}")
+            emit("model_load_failed", model="sarvam", error=str(e))
 
         try:
             if "qwen_vl" not in MODELS:
@@ -399,11 +535,13 @@ def load_main_models():
                     "compute_dtype": str(qwen_dtype),
                 }
                 logger.info(f"✅ Qwen2.5-VL loaded on {device} (4bit={qwen_quant_enabled}, compute_dtype={qwen_dtype})")
+                emit("model_loaded", model="qwen_vl", quantized_4bit=qwen_quant_enabled)
         except Exception as e:
             logger.error(f"❌ Failed to load Qwen2.5-VL model: {e}")
-
+            emit("model_load_failed", model="qwen_vl", error=str(e))
 
     logger.info("✅ Main models loading sequence complete")
+    emit("model_load_completed", loaded_models=list(MODELS.keys()))
 
 
 
@@ -453,6 +591,8 @@ def get_runtime_model_status() -> dict:
         "loaded_models": list(MODELS.keys()),
         "ram_plus_available": "ram_plus" in MODELS,
         "qwen_vl_available": "qwen_vl" in MODELS,
+        "face_provider": get_face_provider_status(),
+        "require_face_cuda": REQUIRE_FACE_CUDA,
     }
     if torch.cuda.is_available():
         try:

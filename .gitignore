@@ -6,6 +6,7 @@ __pycache__/
 .Python
 venv/
 .venv/
+.venv-*/
 env/
 .env/
 *.egg-info/
@@ -29,7 +30,7 @@ coverage.xml
 .env.*
 !.env.example
 
-# --- ML weights & caches (large; download via bootstrap_local_models.py) ---
+# --- ML weights & caches ---
 pretrained/
 models-local/
 .cache/
@@ -40,17 +41,19 @@ models-local/
 *.safetensors
 *.ckpt
 *.onnx
-
-# InsightFace downloads to home dir by default; ignore if copied locally
 .insightface/
 
-# --- Runtime: logs, PIDs, process output ---
+# --- Runtime artifacts (never push) ---
 *.log
 *.pid
 nohup.out
 nginx-run/
+run/
+logs/
+runtime_reports/
+main.py.bak
 
-# --- Local test / sample media (not needed in repo) ---
+# --- Local test / sample media ---
 *.mp3
 *.m4a
 *.wav
@@ -58,9 +61,6 @@ nginx-run/
 /test*.jpg
 /test*.jpeg
 /test*.png
-/trump_*.mp3
-/videoplayback.*
-/maxresdefault.jpg
 
 # --- OS / editor ---
 *.deb
@@ -73,7 +73,7 @@ Thumbs.db
 .vscode/
 .cursor/
 
-# --- Experiments / tooling output ---
+# --- Experiments ---
 wandb/
 lightning_logs/
 mlruns/

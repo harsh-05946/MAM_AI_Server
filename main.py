@@ -1,7 +1,7 @@
 # app/main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from pydantic import BaseModel
-from typing import List, Any, Union
+from typing import List, Any, Union, Optional
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from PIL import Image
@@ -10,7 +10,6 @@ import torch
 import time
 import logging
 import asyncio
-import json
 import io
 import math
 import os
@@ -28,11 +27,25 @@ from models import (
     inference_ram,
     get_model_lock,
     get_runtime_model_status,
-    get_gpu_lock,
+    get_face_provider_status,
     clear_cuda_memory,
     QWEN_MAX_PIXELS,
     QWEN_MIN_PIXELS,
 )
+from runtime.event_logger import emit, get_event_logger
+from runtime.gpu_scheduler import get_gpu_scheduler
+from runtime.model_registry import model_for_endpoint
+from runtime.paths import ensure_runtime_dirs
+from runtime.request_context import (
+    RequestContext,
+    get_request_context,
+    new_request_id,
+    reset_request_context,
+    set_request_context,
+)
+from runtime.run_state import get_run_state
+from runtime.stage_timer import StageTimer
+
 try:
     from qwen_vl_utils import process_vision_info
 except Exception:
@@ -43,7 +56,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 executor = ThreadPoolExecutor(max_workers=4)
-GPU_LOCK = get_gpu_lock()
+SCHEDULER = get_gpu_scheduler()
 BATCHERS: dict[str, "MicroBatcher"] = {}
 INFLIGHT_REQUESTS = 0
 INSTANCE_NAME = os.getenv("INSTANCE_NAME", "main")
@@ -69,10 +82,52 @@ def _env_int(name: str, default: int) -> int:
 BATCHING_ENABLED = _env_bool("BATCHING_ENABLED", True)
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return isinstance(exc, torch.cuda.OutOfMemoryError) or (
+        "out of memory" in msg and "cuda" in msg
+    )
+
+
+def _with_oom_retry(model: str, fn):
+    try:
+        return fn()
+    except Exception as first:
+        if not _is_cuda_oom(first):
+            raise
+        emit("cuda_oom", model=model, error=str(first))
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            clear_cuda_memory(reason=f"oom_recovery:{model}")
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            emit("cuda_oom_retry", model=model)
+            return fn()
+        except Exception as second:
+            emit("cuda_oom_retry_failed", model=model, error=str(second))
+            raise
+
+
+def _mark_parsed(requested_items: Optional[int] = None) -> None:
+    ctx = get_request_context()
+    if ctx is None:
+        return
+    if requested_items is not None:
+        ctx.requested_items = requested_items
+    ctx.timer.mark_parse_finished()
+    emit("request_parsed", requested_items=ctx.requested_items)
+
+
+def _workload_event(kind: str, **fields: Any) -> None:
+    emit("workload_output", workload_kind=kind, **fields)
+
+
 @dataclass
 class BatchItem:
     payload: Any
     future: asyncio.Future
+    ctx: Optional[RequestContext] = None
 
 
 class MicroBatcher:
@@ -103,7 +158,11 @@ class MicroBatcher:
     async def submit(self, payload: Any):
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        await self.queue.put(BatchItem(payload=payload, future=fut))
+        ctx = get_request_context()
+        snap = ctx.snapshot() if ctx is not None else None
+        if snap is not None:
+            snap.timer.microbatch_started = StageTimer.now()
+        await self.queue.put(BatchItem(payload=payload, future=fut, ctx=snap))
         return await fut
 
     async def _run(self):
@@ -131,15 +190,38 @@ class MicroBatcher:
                 batch.append(nxt)
 
             payloads = [item.payload for item in batch]
+            formed_at = StageTimer.now()
+            for item in batch:
+                if item.ctx is not None:
+                    item.ctx.timer.microbatch_finished = formed_at
+            emit(
+                "microbatch_formed",
+                model=self.model_key,
+                batch_size=len(batch),
+                max_batch_size=self.max_batch_size,
+                batch_limit=self.max_batch_size,
+                effective_batch_size=len(batch),
+                batch_fill_percent=round(100.0 * len(batch) / max(self.max_batch_size, 1), 1),
+                fill_ratio=round(len(batch) / max(self.max_batch_size, 1), 3),
+            )
             try:
                 if len(batch) > 1:
                     logger.info(
                         f"⚡ {self.model_key} micro-batch formed: size={len(batch)} "
                         f"(max={self.max_batch_size}, wait_ms={self.max_wait_ms})"
                     )
-                results = await asyncio.get_running_loop().run_in_executor(
-                    executor, lambda: self.process_fn(payloads)
-                )
+                # Prefer first item context inside executor for event correlation.
+                primary_ctx = next((item.ctx for item in batch if item.ctx is not None), None)
+
+                def _run_batch(p=payloads, ctx=primary_ctx):
+                    token = set_request_context(ctx) if ctx is not None else None
+                    try:
+                        return self.process_fn(p)
+                    finally:
+                        if token is not None:
+                            reset_request_context(token)
+
+                results = await asyncio.get_running_loop().run_in_executor(executor, _run_batch)
                 if len(results) != len(batch):
                     raise RuntimeError(
                         f"{self.model_key} batch result size mismatch: "
@@ -156,68 +238,108 @@ class MicroBatcher:
 
 def _process_emotion_batch(images: list[Image.Image]) -> list[dict[str, Any]]:
     lock = get_model_lock("emotion")
-    with GPU_LOCK:
+    ctx = get_request_context()
+
+    def _run():
         with lock:
             proc = MODELS["emotion"]["processor"]
             model = MODELS["emotion"]["model"]
-            inputs = proc(images=images, return_tensors="pt").to(model.device)
-            with torch.no_grad():
-                outputs = model(**inputs)
-            probs = outputs.logits.softmax(dim=-1)
+            inputs = proc(images=images, return_tensors="pt")
+            with SCHEDULER.run(model="emotion", batch_size=len(images), ctx=ctx):
+                inputs = inputs.to(model.device)
+                with torch.inference_mode():
+                    outputs = model(**inputs)
+                probs = outputs.logits.softmax(dim=-1).detach().cpu()
             results = []
             for row in probs:
                 idx = row.argmax().item()
                 results.append({"emotion": model.config.id2label[idx], "confidence": float(row[idx])})
             return results
 
+    return _with_oom_retry("emotion", _run)
+
 
 def _process_scene_batch(images: list[Image.Image]) -> list[dict[str, str]]:
     lock = get_model_lock("scene")
-    with GPU_LOCK:
+    ctx = get_request_context()
+
+    def _run():
         with lock:
             proc = MODELS["scene"]["processor"]
             model = MODELS["scene"]["model"]
-            inputs = proc(images=images, return_tensors="pt").to(model.device)
-            with torch.no_grad():
-                generated = model.generate(**inputs, max_new_tokens=50)
+            inputs = proc(images=images, return_tensors="pt")
+            with SCHEDULER.run(model="scene", batch_size=len(images), ctx=ctx):
+                inputs = inputs.to(model.device)
+                with torch.inference_mode():
+                    generated = model.generate(**inputs, max_new_tokens=50)
+                generated = generated.detach().cpu()
             return [{"scene": proc.decode(seq, skip_special_tokens=True)} for seq in generated]
 
+    return _with_oom_retry("scene", _run)
 
-def _run_ram_single(m: dict[str, Any], image: Image.Image) -> tuple[Any, Any]:
-    image_tensor = m["transform"](image).unsqueeze(0).to(m["device"])
-    with torch.no_grad():
-        tags_en, tags_cn = inference_ram(image_tensor, m["model"])
-    return tags_en, tags_cn
+
+def _run_ram_single(m: dict[str, Any], image: Image.Image, ctx: Optional[RequestContext]) -> tuple[Any, Any]:
+    image_tensor = m["transform"](image).unsqueeze(0)
+
+    def _run():
+        with SCHEDULER.run(model="ram_plus", batch_size=1, ctx=ctx):
+            tensor = image_tensor.to(m["device"])
+            with torch.inference_mode():
+                return inference_ram(tensor, m["model"])
+
+    return _with_oom_retry("ram_plus", _run)
 
 
 def _process_ram_batch(images: list[Image.Image]) -> list[dict[str, Any]]:
     lock = get_model_lock("ram_plus")
-    with GPU_LOCK:
-        with lock:
-            m = MODELS["ram_plus"]
-            try:
-                image_tensor = torch.stack([m["transform"](img) for img in images]).to(m["device"])
-                with torch.no_grad():
-                    tags_en, tags_cn = inference_ram(image_tensor, m["model"])
-                if isinstance(tags_en, list) and isinstance(tags_cn, list):
-                    if len(tags_en) == len(images) and len(tags_cn) == len(images):
-                        return [{"tags_en": en, "tags_cn": cn} for en, cn in zip(tags_en, tags_cn)]
-            except Exception:
-                # Fallback to per-item inference if RAM++ runtime expects batch=1.
-                pass
+    ctx = get_request_context()
+    with lock:
+        m = MODELS["ram_plus"]
+        emit("ram_batch_attempt", model="ram_plus", batch_size=len(images))
+        try:
+            stacked = torch.stack([m["transform"](img) for img in images])
 
-            out = []
-            for img in images:
-                en, cn = _run_ram_single(m, img)
-                out.append({"tags_en": en, "tags_cn": cn})
-            return out
+            def _run_stacked():
+                with SCHEDULER.run(model="ram_plus", batch_size=len(images), ctx=ctx):
+                    image_tensor = stacked.to(m["device"])
+                    with torch.inference_mode():
+                        return inference_ram(image_tensor, m["model"])
+
+            tags_en, tags_cn = _with_oom_retry("ram_plus", _run_stacked)
+            if isinstance(tags_en, list) and isinstance(tags_cn, list):
+                if len(tags_en) == len(images) and len(tags_cn) == len(images):
+                    emit("ram_batch_success", model="ram_plus", batch_size=len(images))
+                    return [{"tags_en": en, "tags_cn": cn} for en, cn in zip(tags_en, tags_cn)]
+            reason = "tag_shape_mismatch"
+        except Exception as exc:
+            reason = f"{type(exc).__name__}:{exc}"
+            logger.warning(f"RAM++ stacked batch failed, falling back per-item: {exc}")
+
+        emit(
+            "ram_batch_fallback",
+            model="ram_plus",
+            batch_size=len(images),
+            reason=reason,
+            fallback_batch_size=1,
+        )
+        out = []
+        for img in images:
+            en, cn = _run_ram_single(m, img, ctx)
+            out.append({"tags_en": en, "tags_cn": cn})
+        return out
 
 
 def _process_face_batch(images_np: list[np.ndarray]) -> list[list[Any]]:
     lock = get_model_lock("face")
+    ctx = get_request_context()
     with lock:
         model = MODELS["face"]
-        return [model.get(img_np) for img_np in images_np]
+        # Face HTTP/micro batches are N sequential ONNX calls (effective batch=1 each).
+        results = []
+        for img_np in images_np:
+            with SCHEDULER.run(model="insightface", batch_size=1, ctx=ctx, use_cuda_events=False):
+                results.append(model.get(img_np))
+        return results
 
 
 def _process_embed_batch(texts: list[str]) -> list[list[float]]:
@@ -225,13 +347,20 @@ def _process_embed_batch(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
     lock = get_model_lock("embed")
+    ctx = get_request_context()
     with lock:
         embedder = MODELS["embed"]
         batch_size_kw: dict[str, int] = {}
         bs = _env_int("EMBED_ENCODE_BATCH_SIZE", 0)
         if bs > 0:
             batch_size_kw["batch_size"] = bs
-        out: Union[np.ndarray, torch.Tensor, list] = embedder.encode(texts, **batch_size_kw)
+
+        def _run():
+            with SCHEDULER.run(model="embed", batch_size=len(texts), ctx=ctx):
+                with torch.inference_mode():
+                    return embedder.encode(texts, **batch_size_kw)
+
+        out: Union[np.ndarray, torch.Tensor, list] = _with_oom_retry("embed", _run)
     if isinstance(out, torch.Tensor):
         out = out.detach().cpu().numpy()
     if not isinstance(out, np.ndarray):
@@ -326,20 +455,32 @@ async def _submit_or_run(model_key: str, payload: Any, fallback_sync):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, fallback_sync)
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    ensure_runtime_dirs()
+    run_state = get_run_state()
+    get_event_logger().start()
+    emit(
+        "server_started",
+        server_run_id=run_state.server_run_id,
+        run_id=run_state.active_run_id(),
+        instance=INSTANCE_NAME,
+    )
     logger.info("🚀 Starting Main Inference Service")
     start = time.perf_counter()
     load_main_models()
     _init_batchers()
     logger.info(f"✅ Main models loaded in {(time.perf_counter() - start):.2f}s")
     yield
-    # Shutdown
     logger.info("🛑 Stopping Main Inference Service")
     await _shutdown_batchers()
     unload_models()
+    emit("server_stopped", server_run_id=run_state.server_run_id)
+    get_event_logger().flush()
+    get_event_logger().stop()
     executor.shutdown(wait=True)
+
 
 app = FastAPI(title="General Inference Server", lifespan=lifespan)
 
@@ -348,13 +489,96 @@ app = FastAPI(title="General Inference Server", lifespan=lifespan)
 async def track_inflight_requests(request: Request, call_next):
     global INFLIGHT_REQUESTS
     INFLIGHT_REQUESTS += 1
+    run_state = get_run_state()
+    timer = StageTimer()
+    timer.mark_request_start()
+    request_id = new_request_id(request.headers.get("x-request-id"))
+    header_run = (request.headers.get("x-run-id") or "").strip()
+    ctx = RequestContext(
+        server_run_id=run_state.server_run_id,
+        run_id=run_state.active_run_id(),
+        job_id=(request.headers.get("x-job-id") or "").strip(),
+        media_id=(request.headers.get("x-media-id") or "").strip(),
+        request_id=request_id,
+        endpoint=request.url.path,
+        http_method=request.method,
+        content_length_bytes=int(request.headers.get("content-length") or 0) or None,
+        model=model_for_endpoint(request.url.path),
+        timer=timer,
+    )
+    if header_run:
+        # Correlation only; campaign identity remains authoritative in run_state.
+        emit("request_correlation_header", header_run_id=header_run)
+    token = set_request_context(ctx)
+    request.state.request_id = request_id
+    request.state.run_id = ctx.run_id
+    request.state.server_run_id = ctx.server_run_id
+    request.state.media_id = ctx.media_id
+    request.state.job_id = ctx.job_id
+    admitted = False
+    is_process = request.url.path.startswith("/process/")
     try:
-        return await call_next(request)
+        emit(
+            "request_received",
+            requested_items=None,
+            content_length_bytes=ctx.content_length_bytes,
+        )
+        if is_process:
+            if SCHEDULER.reject_when_full:
+                ok = await asyncio.get_running_loop().run_in_executor(
+                    executor,
+                    lambda: SCHEDULER.acquire_admission_nowait(ctx=ctx, timer=timer),
+                )
+                if not ok:
+                    emit("queue_rejected", endpoint=ctx.endpoint)
+                    from fastapi.responses import JSONResponse
+
+                    return JSONResponse(
+                        status_code=429,
+                        content={"detail": "GPU admission queue full"},
+                        headers={
+                            "Retry-After": "10",
+                            "X-Request-ID": request_id,
+                            "X-Run-ID": ctx.run_id,
+                        },
+                    )
+                admitted = True
+            else:
+                await asyncio.get_running_loop().run_in_executor(
+                    executor, lambda: SCHEDULER.acquire_admission(ctx=ctx, timer=timer)
+                )
+                admitted = True
+        response = await call_next(request)
+        timer.response_finished = StageTimer.now()
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Run-ID"] = ctx.run_id
+        if response.status_code >= 400:
+            emit(
+                "request_failed",
+                status_code=response.status_code,
+                **timer.as_dict(),
+            )
+        else:
+            emit(
+                "request_completed",
+                status_code=response.status_code,
+                **timer.as_dict(),
+            )
+        return response
+    except Exception as exc:
+        timer.response_finished = StageTimer.now()
+        emit("request_failed", error=str(exc), **timer.as_dict())
+        raise
     finally:
+        if admitted:
+            SCHEDULER.release_admission()
+        reset_request_context(token)
         INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
+
 
 class EmbeddingRequest(BaseModel):
     texts: List[str]
+
 
 class SarvamTranslationRequest(BaseModel):
     text: str
@@ -395,9 +619,7 @@ SUPPORTED_LANGUAGES = {
 }
 QWEN_DEFAULT_PROMPT = "Extract all text present in the image and return only that text, without any additional explanation or formatting. Preserve the original language exactly as it appears, and do not translate it."
 
-# ===============================
-# Helper for Locked Inference
-# ===============================
+
 def _lock_inference(lock, fn):
     with lock:
         return fn()
@@ -426,6 +648,7 @@ async def _read_rgb_uploads(
             raise HTTPException(status_code=400, detail=f"Invalid image file: {uf.filename!r}")
         images.append(img)
         names.append(uf.filename or "")
+    _mark_parsed(len(images))
     return images, names
 
 
@@ -463,6 +686,7 @@ def _sarvam_generate_batch(
     messages_list: list[list[dict[str, str]]],
     max_length: int,
     temperature: float,
+    ctx: Optional[RequestContext] = None,
 ) -> list[str]:
     """Run one batched Sarvam forward for N chat conversations (left-padded)."""
     if not messages_list:
@@ -486,23 +710,27 @@ def _sarvam_generate_batch(
             padding=True,
             truncation=True,
             return_tensors="pt",
-        ).to(model.device)
+        )
 
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **model_inputs,
-                max_new_tokens=max_length,
-                do_sample=True,
-                temperature=max(temperature, 0.01),
-                num_return_sequences=1,
-            )
+        def _run():
+            with SCHEDULER.run(model="sarvam", batch_size=len(messages_list), ctx=ctx):
+                inputs = model_inputs.to(model.device)
+                with torch.inference_mode():
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=max_length,
+                        do_sample=True,
+                        temperature=max(temperature, 0.01),
+                        num_return_sequences=1,
+                    )
+                prompt_len = inputs.input_ids.shape[1]
+                outputs: list[str] = []
+                for i in range(generated_ids.shape[0]):
+                    out_ids = generated_ids[i, prompt_len:].tolist()
+                    outputs.append(tokenizer.decode(out_ids, skip_special_tokens=True).strip())
+                return outputs
 
-        prompt_len = model_inputs.input_ids.shape[1]
-        outputs: list[str] = []
-        for i in range(generated_ids.shape[0]):
-            out_ids = generated_ids[i, prompt_len:].tolist()
-            outputs.append(tokenizer.decode(out_ids, skip_special_tokens=True).strip())
-        return outputs
+        return _with_oom_retry("sarvam", _run)
     finally:
         tokenizer.padding_side = orig_padding_side
 
@@ -520,6 +748,7 @@ def _process_sarvam_batch(texts: list[str], target_lang: str) -> list[str]:
     model = sarvam_bundle["model"]
     lock = get_model_lock("sarvam")
     resolved_target = _resolve_target_language(target_lang)
+    ctx = get_request_context()
 
     first_messages = [
         [
@@ -529,41 +758,42 @@ def _process_sarvam_batch(texts: list[str], target_lang: str) -> list[str]:
         for t in texts
     ]
 
-    with GPU_LOCK:
-        with lock:
-            outputs = _sarvam_generate_batch(
-                tokenizer,
-                model,
-                first_messages,
-                max_length=SARVAM_DEFAULT_MAX_LENGTH,
-                temperature=SARVAM_DEFAULT_TEMPERATURE,
-            )
+    with lock:
+        outputs = _sarvam_generate_batch(
+            tokenizer,
+            model,
+            first_messages,
+            max_length=SARVAM_DEFAULT_MAX_LENGTH,
+            temperature=SARVAM_DEFAULT_TEMPERATURE,
+            ctx=ctx,
+        )
 
-            if resolved_target != "English":
-                retry_indices = [i for i, o in enumerate(outputs) if _mostly_latin(o)]
-                if retry_indices:
-                    second_messages = [
-                        [
-                            {
-                                "role": "system",
-                                "content": (
-                                    f"Translate the text below to {resolved_target}. "
-                                    f"Return only {resolved_target} text, no notes."
-                                ),
-                            },
-                            {"role": "user", "content": outputs[i]},
-                        ]
-                        for i in retry_indices
+        if resolved_target != "English":
+            retry_indices = [i for i, o in enumerate(outputs) if _mostly_latin(o)]
+            if retry_indices:
+                second_messages = [
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                f"Translate the text below to {resolved_target}. "
+                                f"Return only {resolved_target} text, no notes."
+                            ),
+                        },
+                        {"role": "user", "content": outputs[i]},
                     ]
-                    second_out = _sarvam_generate_batch(
-                        tokenizer,
-                        model,
-                        second_messages,
-                        max_length=SARVAM_DEFAULT_MAX_LENGTH,
-                        temperature=SARVAM_DEFAULT_TEMPERATURE,
-                    )
-                    for idx, new_text in zip(retry_indices, second_out):
-                        outputs[idx] = new_text
+                    for i in retry_indices
+                ]
+                second_out = _sarvam_generate_batch(
+                    tokenizer,
+                    model,
+                    second_messages,
+                    max_length=SARVAM_DEFAULT_MAX_LENGTH,
+                    temperature=SARVAM_DEFAULT_TEMPERATURE,
+                    ctx=ctx,
+                )
+                for idx, new_text in zip(retry_indices, second_out):
+                    outputs[idx] = new_text
 
     return outputs
 
@@ -595,6 +825,7 @@ def _process_qwen_batch(images: list[Image.Image], prompt: str) -> list[str]:
     processor = qwen_bundle["processor"]
     model = qwen_bundle["model"]
     lock = get_model_lock("qwen_vl")
+    ctx = get_request_context()
 
     processed: list[Image.Image] = []
     for image in images:
@@ -641,42 +872,46 @@ def _process_qwen_batch(images: list[Image.Image], prompt: str) -> list[str]:
         min_pixels=max(min(QWEN_MIN_PIXELS, QWEN_MAX_PIXELS), 1),
     )
 
-    with GPU_LOCK:
-        with lock:
-            try:
-                inputs = processor(**processor_kwargs).to(model.device)
-            except TypeError:
-                processor_kwargs.pop("max_pixels", None)
-                processor_kwargs.pop("min_pixels", None)
-                inputs = processor(**processor_kwargs).to(model.device)
+    with lock:
+        try:
+            raw_inputs = processor(**processor_kwargs)
+        except TypeError:
+            processor_kwargs.pop("max_pixels", None)
+            processor_kwargs.pop("min_pixels", None)
+            raw_inputs = processor(**processor_kwargs)
 
-            with torch.no_grad():
-                generated_ids = model.generate(**inputs, max_new_tokens=256)
+        def _run():
+            with SCHEDULER.run(model="qwen_vl", batch_size=len(images), ctx=ctx):
+                inputs = raw_inputs.to(model.device)
+                with torch.inference_mode():
+                    generated_ids = model.generate(**inputs, max_new_tokens=256)
 
-            attn = getattr(inputs, "attention_mask", None)
-            if attn is not None and hasattr(generated_ids, "shape") and generated_ids.dim() == 2:
-                output_ids = [
-                    generated_ids[i, int(attn[i].sum().item()) :]
-                    for i in range(generated_ids.shape[0])
-                ]
-            elif isinstance(generated_ids, list):
-                prompt_input_ids = getattr(inputs, "input_ids", None)
-                if hasattr(prompt_input_ids, "shape"):
-                    prompt_len = prompt_input_ids.shape[1]
-                elif isinstance(prompt_input_ids, list) and prompt_input_ids:
-                    prompt_len = len(prompt_input_ids[0])
+                attn = getattr(inputs, "attention_mask", None)
+                if attn is not None and hasattr(generated_ids, "shape") and generated_ids.dim() == 2:
+                    output_ids = [
+                        generated_ids[i, int(attn[i].sum().item()) :]
+                        for i in range(generated_ids.shape[0])
+                    ]
+                elif isinstance(generated_ids, list):
+                    prompt_input_ids = getattr(inputs, "input_ids", None)
+                    if hasattr(prompt_input_ids, "shape"):
+                        prompt_len = prompt_input_ids.shape[1]
+                    elif isinstance(prompt_input_ids, list) and prompt_input_ids:
+                        prompt_len = len(prompt_input_ids[0])
+                    else:
+                        prompt_len = 0
+                    output_ids = [row[prompt_len:] for row in generated_ids]
                 else:
-                    prompt_len = 0
-                output_ids = [row[prompt_len:] for row in generated_ids]
-            else:
-                prompt_len = inputs.input_ids.shape[1]
-                output_ids = [row for row in generated_ids[:, prompt_len:]]
+                    prompt_len = inputs.input_ids.shape[1]
+                    output_ids = [row for row in generated_ids[:, prompt_len:]]
 
-            output_text = processor.batch_decode(
-                output_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
+                return processor.batch_decode(
+                    output_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+
+        output_text = _with_oom_retry("qwen_vl", _run)
 
     return [t.strip() for t in output_text]
 
@@ -700,19 +935,20 @@ async def face_recognition(file: UploadFile = File(...)):
     start = time.perf_counter()
     img = Image.open(file.file).convert("RGB")
     img_np = np.array(img)
-    
+    _mark_parsed(1)
+
     lock = get_model_lock("face")
-    loop = asyncio.get_event_loop()
-    try:
-        faces = await _submit_or_run(
-            "face",
-            img_np,
-            lambda: _lock_inference(lock, lambda: MODELS["face"].get(img_np)),
-        )
-    finally:
-        clear_cuda_memory("after face stage")
+    faces = await _submit_or_run(
+        "face",
+        img_np,
+        lambda: _lock_inference(
+            lock,
+            lambda: _process_face_batch([img_np])[0],
+        ),
+    )
 
     duration = time.perf_counter() - start
+    _workload_event("face", frames=1, faces_detected=len(faces))
     logger.info(f"🧑 Face recognition finished in {duration:.3f}s")
     return [
         {"bbox": face.bbox.tolist(), "embedding": face.normed_embedding.tolist()}
@@ -738,15 +974,14 @@ async def face_recognition_batch(
 
     start = time.perf_counter()
     loop = asyncio.get_event_loop()
-    try:
-        images_np = [np.array(img) for img in images]
-        batch_results = await loop.run_in_executor(
-            executor,
-            lambda ims=list(images_np): _process_face_batch(ims),
-        )
-    finally:
-        clear_cuda_memory("after face batch stage")
-        logger.info(f"🧑 Face batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
+    images_np = [np.array(img) for img in images]
+    batch_results = await loop.run_in_executor(
+        executor,
+        lambda ims=list(images_np): _process_face_batch(ims),
+    )
+    logger.info(f"🧑 Face batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
+    faces_detected = sum(len(faces) for faces in batch_results)
+    _workload_event("face", frames=len(images), faces_detected=faces_detected)
 
     out: list[dict[str, Any]] = []
     for name, faces in zip(names, batch_results):
@@ -770,18 +1005,17 @@ async def emotion_detection(file: UploadFile = File(...)):
     logger.info(f"😊 Emotion detection: {file.filename}")
     start = time.perf_counter()
     image = Image.open(file.file).convert("RGB")
-    
-    try:
-        result = await _submit_or_run(
-            "emotion",
-            image,
-            lambda: _process_emotion_batch([image])[0],
-        )
-        return result
-    finally:
-        duration = time.perf_counter() - start
-        logger.info(f"😊 Emotion finished in {duration:.3f}s")
-        clear_cuda_memory("after emotion stage")
+    _mark_parsed(1)
+
+    result = await _submit_or_run(
+        "emotion",
+        image,
+        lambda: _process_emotion_batch([image])[0],
+    )
+    duration = time.perf_counter() - start
+    _workload_event("emotion", emotion_crops=1)
+    logger.info(f"😊 Emotion finished in {duration:.3f}s")
+    return result
 
 
 @app.post("/process/emotion/batch")
@@ -794,15 +1028,12 @@ async def emotion_detection_batch(files: List[UploadFile] = File(..., descriptio
 
     start = time.perf_counter()
     loop = asyncio.get_event_loop()
-    try:
-        results = await loop.run_in_executor(
-            executor,
-            lambda ims=list(images): _process_emotion_batch(ims),
-        )
-    finally:
-        clear_cuda_memory("after emotion batch stage")
-        logger.info(f"😊 Emotion batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
-
+    results = await loop.run_in_executor(
+        executor,
+        lambda ims=list(images): _process_emotion_batch(ims),
+    )
+    logger.info(f"😊 Emotion batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
+    _workload_event("emotion", emotion_crops=len(images))
     return _attach_filenames(names, results)
 
 
@@ -814,18 +1045,17 @@ async def scene_description(file: UploadFile = File(...)):
     logger.info(f"🖼️ Scene description: {file.filename}")
     start = time.perf_counter()
     image = Image.open(file.file).convert("RGB")
-    
-    try:
-        result = await _submit_or_run(
-            "scene",
-            image,
-            lambda: _process_scene_batch([image])[0],
-        )
-        return result
-    finally:
-        duration = time.perf_counter() - start
-        logger.info(f"🖼️ Scene finished in {duration:.3f}s")
-        clear_cuda_memory("after scene stage")
+    _mark_parsed(1)
+
+    result = await _submit_or_run(
+        "scene",
+        image,
+        lambda: _process_scene_batch([image])[0],
+    )
+    duration = time.perf_counter() - start
+    _workload_event("scene", images=1)
+    logger.info(f"🖼️ Scene finished in {duration:.3f}s")
+    return result
 
 
 @app.post("/process/scene/batch")
@@ -840,15 +1070,12 @@ async def scene_description_batch(
 
     start = time.perf_counter()
     loop = asyncio.get_event_loop()
-    try:
-        results = await loop.run_in_executor(
-            executor,
-            lambda ims=list(images): _process_scene_batch(ims),
-        )
-    finally:
-        clear_cuda_memory("after scene batch stage")
-        logger.info(f"🖼️ Scene batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
-
+    results = await loop.run_in_executor(
+        executor,
+        lambda ims=list(images): _process_scene_batch(ims),
+    )
+    logger.info(f"🖼️ Scene batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
+    _workload_event("scene", images=len(images))
     return _attach_filenames(names, results)
 
 
@@ -858,24 +1085,23 @@ async def scene_description_batch(
 @app.post("/process/object-detection")
 async def object_detection(file: UploadFile = File(...)):
     logger.info(f"🏷️ RAM++ object detection: {file.filename}")
-    
+
     if "ram_plus" not in MODELS:
         raise HTTPException(status_code=503, detail="RAM++ model not available")
 
     start = time.perf_counter()
     image = Image.open(file.file).convert("RGB")
-    
-    try:
-        result = await _submit_or_run(
-            "ram_plus",
-            image,
-            lambda: _process_ram_batch([image])[0],
-        )
-        return result
-    finally:
-        duration = time.perf_counter() - start
-        logger.info(f"🏷️ RAM++ finished in {duration:.3f}s")
-        clear_cuda_memory("after ram++")
+    _mark_parsed(1)
+
+    result = await _submit_or_run(
+        "ram_plus",
+        image,
+        lambda: _process_ram_batch([image])[0],
+    )
+    duration = time.perf_counter() - start
+    _workload_event("ram_plus", images=1)
+    logger.info(f"🏷️ RAM++ finished in {duration:.3f}s")
+    return result
 
 
 @app.post("/process/object-detection/batch")
@@ -893,15 +1119,12 @@ async def object_detection_batch(
 
     start = time.perf_counter()
     loop = asyncio.get_event_loop()
-    try:
-        results = await loop.run_in_executor(
-            executor,
-            lambda ims=list(images): _process_ram_batch(ims),
-        )
-    finally:
-        clear_cuda_memory("after ram++ batch stage")
-        logger.info(f"🏷️ RAM++ batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
-
+    results = await loop.run_in_executor(
+        executor,
+        lambda ims=list(images): _process_ram_batch(ims),
+    )
+    logger.info(f"🏷️ RAM++ batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s")
+    _workload_event("ram_plus", images=len(images))
     return _attach_filenames(names, results)
 
 
@@ -912,6 +1135,7 @@ async def object_detection_batch(
 async def create_embeddings(req: EmbeddingRequest):
     if not req.texts:
         raise HTTPException(status_code=400, detail="texts must be a non-empty list")
+    _mark_parsed(len(req.texts))
 
     logger.info(f"🔗 Embeddings request: {len(req.texts)} items")
     start = time.perf_counter()
@@ -935,8 +1159,10 @@ async def create_embeddings(req: EmbeddingRequest):
         )
 
     duration = time.perf_counter() - start
+    _workload_event("embed", texts=len(req.texts))
     logger.info(f"🔗 Embeddings finished in {duration:.3f}s")
     return {"embeddings": embeddings, "count": len(embeddings)}
+
 
 # ===============================
 # Sarvam Translation
@@ -945,6 +1171,7 @@ async def create_embeddings(req: EmbeddingRequest):
 async def sarvam_translation(req: SarvamTranslationRequest):
     if "sarvam" not in MODELS:
         raise HTTPException(status_code=503, detail="Sarvam translation model not available")
+    _mark_parsed(1)
 
     logger.info(f"🇮🇳 Sarvam translation: {req.text[:30]}... -> {req.target_lang}")
     start = time.perf_counter()
@@ -955,6 +1182,7 @@ async def sarvam_translation(req: SarvamTranslationRequest):
             (req.text, req.target_lang),
             lambda: _process_sarvam_batch([req.text], req.target_lang)[0],
         )
+        _workload_event("sarvam", texts=1)
         return {"translated_text": translated, "target_lang": req.target_lang, "engine": "sarvam"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -963,7 +1191,6 @@ async def sarvam_translation(req: SarvamTranslationRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         logger.info(f"🇮🇳 Sarvam finished in {time.perf_counter() - start:.3f}s")
-        clear_cuda_memory("after sarvam")
 
 
 @app.post("/process/translation/sarvam/batch")
@@ -980,13 +1207,13 @@ async def sarvam_translation_batch(req: SarvamTranslationBatchRequest):
             status_code=400,
             detail=f"At most {max_n} texts allowed (SARVAM_BATCH_MAX)",
         )
+    _mark_parsed(len(req.texts))
 
     logger.info(f"🇮🇳 Sarvam batch translation: n={len(req.texts)} -> {req.target_lang}")
     start = time.perf_counter()
     loop = asyncio.get_event_loop()
 
     try:
-        clear_cuda_memory("before sarvam batch")
         translated = await loop.run_in_executor(
             executor,
             lambda texts=list(req.texts), lang=req.target_lang: _process_sarvam_batch(texts, lang),
@@ -996,6 +1223,7 @@ async def sarvam_translation_batch(req: SarvamTranslationBatchRequest):
                 status_code=500,
                 detail=f"Sarvam batch size mismatch: expected {len(req.texts)}, got {len(translated)}",
             )
+        _workload_event("sarvam", texts=len(req.texts))
         return {
             "translated_texts": translated,
             "target_lang": req.target_lang,
@@ -1011,7 +1239,6 @@ async def sarvam_translation_batch(req: SarvamTranslationBatchRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         logger.info(f"🇮🇳 Sarvam batch finished in {time.perf_counter() - start:.3f}s")
-        clear_cuda_memory("after sarvam batch")
 
 
 @app.post("/process/caption/qwen")
@@ -1028,17 +1255,18 @@ async def qwen_caption(file: UploadFile = File(...), prompt: str = Form(QWEN_DEF
         image = Image.open(io.BytesIO(content)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image file")
+    _mark_parsed(1)
 
     start = time.perf_counter()
     prompt_used = _normalize_qwen_prompt(prompt)
 
     try:
-        clear_cuda_memory("before qwen caption")
         caption = await _submit_or_run(
             "qwen_vl",
             (image, prompt_used),
             lambda img=image, p=prompt_used: _process_qwen_microbatch([(img, p)])[0],
         )
+        _workload_event("qwen_vl", images=1)
         return {
             "caption": caption,
             "model": "Qwen/Qwen2.5-VL-3B-Instruct",
@@ -1050,8 +1278,6 @@ async def qwen_caption(file: UploadFile = File(...), prompt: str = Form(QWEN_DEF
     except Exception as e:
         logger.exception("Qwen captioning failed")
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        clear_cuda_memory("after qwen caption")
 
 
 @app.post("/process/caption/qwen/batch")
@@ -1073,7 +1299,6 @@ async def qwen_caption_batch(
     loop = asyncio.get_event_loop()
 
     try:
-        clear_cuda_memory("before qwen caption batch")
         captions = await loop.run_in_executor(
             executor,
             lambda ims=list(images), p=prompt_used: _process_qwen_batch(ims, p),
@@ -1084,7 +1309,6 @@ async def qwen_caption_batch(
         logger.exception("Qwen caption batch failed")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        clear_cuda_memory("after qwen caption batch")
         logger.info(
             f"🖼️ Qwen caption batch finished: n={len(files)} in {(time.perf_counter() - start):.3f}s"
         )
@@ -1095,6 +1319,7 @@ async def qwen_caption_batch(
             detail=f"Qwen batch size mismatch: expected {len(files)}, got {len(captions)}",
         )
 
+    _workload_event("qwen_vl", images=len(images))
     out: list[dict[str, Any]] = []
     for name, caption in zip(names, captions):
         item: dict[str, Any] = {
@@ -1111,11 +1336,18 @@ async def qwen_caption_batch(
 @app.get("/health")
 def health():
     status = get_runtime_model_status()
+    run_state = get_run_state()
+    sched = SCHEDULER.snapshot()
+    face = get_face_provider_status()
     return {
         "status": "ok",
         "service": "main-inference",
         "instance": INSTANCE_NAME,
         "inflight_requests": INFLIGHT_REQUESTS,
+        "server_run_id": run_state.server_run_id,
+        "campaign_run_id": run_state.campaign_run_id,
+        "campaign_state": run_state.campaign_state,
+        "scheduler": sched,
+        "face_provider_pass": face.get("pass"),
         **status,
     }
-
