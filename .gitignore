@@ -41,6 +41,11 @@ models-local/
 *.safetensors
 *.ckpt
 *.onnx
+*.onnx.data
+*.engine
+*.plan
+# Triton exported weights live under version dirs; keep configs/metadata tracked
+triton_models/**/1/
 .insightface/
 
 # --- Runtime artifacts (never push) ---

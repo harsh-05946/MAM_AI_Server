@@ -1,0 +1,14 @@
+# PLACEHOLDER — do not rename to config.pbtxt until an ONNX/TensorRT artifact exists.
+#
+# name: "embed"
+# platform: "onnxruntime_onnx"
+# max_batch_size: 32
+# input [
+#   { name: "input_ids", data_type: TYPE_INT64, dims: [ -1 ] }
+#   { name: "attention_mask", data_type: TYPE_INT64, dims: [ -1 ] }
+# ]
+# output [
+#   { name: "sentence_embedding", data_type: TYPE_FP32, dims: [ 384 ] }
+# ]
+# instance_group [ { count: 1, kind: KIND_GPU } ]
+# dynamic_batching { }

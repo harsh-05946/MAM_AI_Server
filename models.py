@@ -50,11 +50,32 @@ def _patch_transformers_for_ram() -> None:
 _patch_transformers_for_ram()
 
 from insightface.app import FaceAnalysis
-from ram import get_transform, inference_ram
+from ram import get_transform
 from ram.models import ram_plus
 from sentence_transformers import SentenceTransformer
+from runtime.offline_mode import is_offline_mode
 
 logger = logging.getLogger(__name__)
+
+
+def inference_ram_batch(image_tensor, model) -> tuple[list, list]:
+    """Run RAM++ generate_tag and return one tag string per batch row.
+
+    Upstream ram.inference_ram always returns tags[0] only, which forces false
+    per-image fallback after a successful batched forward.
+    """
+    tags_en, tags_cn = model.generate_tag(image_tensor)
+    if not isinstance(tags_en, list):
+        tags_en = [tags_en]
+    if not isinstance(tags_cn, list):
+        tags_cn = [tags_cn]
+    return tags_en, tags_cn
+
+
+def inference_ram(image_tensor, model):
+    """Single-image helper; returns (tags_en, tags_cn) scalars/strings for one row."""
+    tags_en, tags_cn = inference_ram_batch(image_tensor, model)
+    return tags_en[0], tags_cn[0]
 
 MODEL_URLS = {
     "ram_plus": "https://huggingface.co/xinyu1205/recognize-anything-plus-model/resolve/main/ram_plus_swin_large_14m.pth",
@@ -80,6 +101,8 @@ MAIN_MODEL_SOURCE_ENV = {
 
 PRETRAINED_DIR = Path(__file__).parent / "pretrained"
 DEFAULT_MODEL_CACHE_DIR = Path(__file__).parent / "models-local"
+DEFAULT_INSIGHTFACE_ROOT = Path.home() / ".insightface"
+DEFAULT_INSIGHTFACE_BUFFALO = DEFAULT_INSIGHTFACE_ROOT / "models" / "buffalo_l"
 
 MODELS = {}
 MODEL_LOCKS = {}
@@ -113,12 +136,8 @@ if QWEN_MIN_PIXELS > QWEN_MAX_PIXELS:
     QWEN_MIN_PIXELS = QWEN_MAX_PIXELS
 
 
-def _is_offline_mode() -> bool:
-    return _bool_env("HF_HUB_OFFLINE", False) or _bool_env("TRANSFORMERS_OFFLINE", False)
-
-
 def _allow_hub_fallback() -> bool:
-    if _is_offline_mode():
+    if is_offline_mode():
         return False
     return _bool_env("ALLOW_HF_FALLBACK", True)
 
@@ -150,7 +169,99 @@ def _resolve_model_source(model_key: str, service: str) -> tuple[str, bool]:
 
 
 def _hf_kwargs() -> dict:
-    return {"local_files_only": _is_offline_mode()}
+    return {"local_files_only": is_offline_mode()}
+
+
+def _insightface_root() -> Path:
+    raw = os.getenv("LOCAL_INSIGHTFACE_ROOT")
+    if raw:
+        return Path(raw).expanduser()
+    return DEFAULT_INSIGHTFACE_ROOT
+
+
+def _insightface_buffalo_dir() -> Path:
+    return _insightface_root() / "models" / "buffalo_l"
+
+
+def _ensure_offline_face_assets() -> None:
+    if not is_offline_mode():
+        return
+    buffalo_dir = _insightface_buffalo_dir()
+    expected = (
+        "det_10g.onnx",
+        "2d106det.onnx",
+        "genderage.onnx",
+        "w600k_r50.onnx",
+    )
+    missing = [name for name in expected if not (buffalo_dir / name).exists()]
+    if not missing:
+        return
+    raise RuntimeError(
+        "Offline mode active and InsightFace buffalo_l assets are missing: "
+        f"{missing}. Expected under '{buffalo_dir}'. "
+        "Pre-cache model assets online, or set LOCAL_INSIGHTFACE_ROOT to a prepared cache."
+    )
+
+
+def _triton_flag_enabled(name: str) -> bool:
+    return _bool_env(name, False)
+
+
+def _missing_triton_onnx_assets() -> list[str]:
+    repo = Path(os.getenv("TRITON_MODEL_REPO") or (Path(__file__).parent / "triton_models")).expanduser()
+    checks = (
+        ("USE_TRITON_EMOTION", "emotion"),
+        ("USE_TRITON_EMBED", "embed"),
+        ("USE_TRITON_RAM", "ram_plus"),
+        ("USE_TRITON_SCENE", "scene"),
+        ("USE_TRITON_FACE", "insightface"),
+    )
+    missing: list[str] = []
+    for flag, model_name in checks:
+        if not _triton_flag_enabled(flag):
+            continue
+        config = repo / model_name / "config.pbtxt"
+        onnx = repo / model_name / "1" / "model.onnx"
+        if not config.is_file() or not onnx.is_file():
+            missing.append(model_name)
+    return missing
+
+
+def preflight_local_assets(*, strict: bool = False) -> dict[str, object]:
+    """Report local asset availability; raise in strict mode on missing items."""
+    model_paths = {
+        key: str((_local_dir_for(key, "main") or (DEFAULT_MODEL_CACHE_DIR / "main" / key)))
+        for key in MAIN_MODEL_SOURCE_ENV
+    }
+    missing_models = [k for k in MAIN_MODEL_SOURCE_ENV if not Path(model_paths[k]).exists()]
+    ram_path = os.getenv("LOCAL_RAM_PLUS_WEIGHTS") or str(PRETRAINED_DIR / "ram_plus_swin_large_14m.pth")
+    missing_ram = not Path(ram_path).exists()
+    face_dir = _insightface_buffalo_dir()
+    face_expected = ("det_10g.onnx", "2d106det.onnx", "genderage.onnx", "w600k_r50.onnx")
+    missing_face = [name for name in face_expected if not (face_dir / name).exists()]
+    missing_triton_onnx = _missing_triton_onnx_assets()
+
+    payload: dict[str, object] = {
+        "offline_mode": is_offline_mode(),
+        "model_paths": model_paths,
+        "missing_models": missing_models,
+        "ram_plus_weights_path": ram_path,
+        "ram_plus_weights_missing": missing_ram,
+        "insightface_buffalo_dir": str(face_dir),
+        "insightface_missing_files": missing_face,
+        "missing_triton_onnx": missing_triton_onnx,
+    }
+    if strict and (missing_models or missing_ram or missing_face or missing_triton_onnx):
+        raise RuntimeError(
+            "Offline asset preflight failed: "
+            f"missing_models={missing_models}, "
+            f"ram_plus_missing={missing_ram}, "
+            f"insightface_missing={missing_face}, "
+            f"missing_triton_onnx={missing_triton_onnx}. "
+            "While online run: uv run python bootstrap_local_models.py "
+            "(and export Triton ONNX via tools/export_*_onnx.py if USE_TRITON_*=true)."
+        )
+    return payload
 
 
 def _log_model_source(model_key: str, source: str, is_local: bool) -> None:
@@ -359,6 +470,8 @@ def load_main_models():
 
     device, torch_dtype = get_device_info()
     emit("model_load_started", device=device)
+    if is_offline_mode():
+        preflight_local_assets(strict=True)
 
     with MODELS_LOCK:
         try:
@@ -371,6 +484,7 @@ def load_main_models():
                     emit("model_load_failed", model="insightface", reason="cuda_unavailable")
                 else:
                     logger.info("📦 Loading InsightFace (GPU-only)...")
+                    _ensure_offline_face_assets()
                     _preload_ort_cuda_libs()
                     cuda_options = {
                         "device_id": 0,
@@ -384,10 +498,14 @@ def load_main_models():
                         "CPUExecutionProvider",
                     ]
                     try:
-                        face_app = FaceAnalysis(name="buffalo_l", providers=providers)
+                        face_app = FaceAnalysis(
+                            name="buffalo_l",
+                            root=str(_insightface_root()),
+                            providers=providers,
+                        )
                     except TypeError:
                         # Older insightface builds may not accept 'providers='.
-                        face_app = FaceAnalysis(name="buffalo_l")
+                        face_app = FaceAnalysis(name="buffalo_l", root=str(_insightface_root()))
                     face_app.prepare(ctx_id=0, det_size=(640, 640))
                     status = validate_face_providers(face_app)
                     if REQUIRE_FACE_CUDA and not status.get("pass"):
@@ -563,7 +681,7 @@ def _download_weights(model_name: str) -> Path:
     if weight_path.exists():
         return weight_path
 
-    if _is_offline_mode():
+    if is_offline_mode():
         raise RuntimeError(
             f"Offline mode active and RAM++ weights not found at '{weight_path}'. "
             "Set LOCAL_RAM_PLUS_WEIGHTS or pre-download into pretrained/."
@@ -586,11 +704,14 @@ def _load_ram_plus_model(device: str):
 
 def get_runtime_model_status() -> dict:
     payload = {
-        "offline_mode": _is_offline_mode(),
+        "offline_mode": is_offline_mode(),
+        "ai_offline_mode": _bool_env("AI_OFFLINE_MODE", False),
         "allow_hf_fallback": _allow_hub_fallback(),
         "loaded_models": list(MODELS.keys()),
         "ram_plus_available": "ram_plus" in MODELS,
         "qwen_vl_available": "qwen_vl" in MODELS,
+        "insightface_root": str(_insightface_root()),
+        "insightface_buffalo_dir": str(_insightface_buffalo_dir()),
         "face_provider": get_face_provider_status(),
         "require_face_cuda": REQUIRE_FACE_CUDA,
     }

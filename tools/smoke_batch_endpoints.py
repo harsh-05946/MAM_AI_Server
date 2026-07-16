@@ -38,9 +38,14 @@ def main() -> int:
     with httpx.Client(timeout=120.0) as client:
         r = client.get(f"{base}/health")
         r.raise_for_status()
+        assert r.json().get("status") == "alive", r.json()
+        r = client.get(f"{base}/ready")
+        print("ready:", r.status_code, {k: r.json().get(k) for k in ("status", "service_state", "accepting_requests")})
+        r = client.get(f"{base}/internal/runtime")
+        r.raise_for_status()
         health = r.json()
         loaded = set(health.get("loaded_models") or [])
-        print("health:", {k: health.get(k) for k in ("status", "loaded_models") if k in health})
+        print("runtime:", {k: health.get(k) for k in ("status", "loaded_models") if k in health})
 
         r = client.post(
             f"{base}/process/embeddings",

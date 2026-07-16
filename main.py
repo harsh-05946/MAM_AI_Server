@@ -10,6 +10,7 @@ import torch
 import time
 import logging
 import asyncio
+import collections
 import io
 import math
 import os
@@ -18,6 +19,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
 load_dotenv()
+from runtime.offline_mode import apply_offline_env_defaults
+
+apply_offline_env_defaults()
 
 # Local imports
 from models import (
@@ -25,6 +29,7 @@ from models import (
     load_main_models,
     unload_models,
     inference_ram,
+    inference_ram_batch,
     get_model_lock,
     get_runtime_model_status,
     get_face_provider_status,
@@ -32,19 +37,39 @@ from models import (
     QWEN_MAX_PIXELS,
     QWEN_MIN_PIXELS,
 )
+from runtime.capacity_profile import build_capacity_response
 from runtime.event_logger import emit, get_event_logger
 from runtime.gpu_scheduler import get_gpu_scheduler
 from runtime.model_registry import model_for_endpoint
 from runtime.paths import ensure_runtime_dirs
+from runtime.readiness_manager import get_readiness_manager
 from runtime.request_context import (
     RequestContext,
     get_request_context,
+    new_attempt_id,
     new_request_id,
+    parse_deadline_headers,
     reset_request_context,
     set_request_context,
 )
+from runtime.request_registry import (
+    RequestCancelled,
+    RequestState,
+    get_request_registry,
+)
 from runtime.run_state import get_run_state
 from runtime.stage_timer import StageTimer
+from runtime.triton_router import require_native_or_raise, resolve_backend, triton_runtime_status
+from runtime.emotion_triton import (
+    infer_emotion_triton,
+    load_emotion_id2label,
+    preprocess_emotion_pixel_values,
+)
+from runtime.ram_triton import infer_ram_triton, preprocess_ram_images
+from runtime.embed_triton import infer_embed_triton, tokenize_for_embed
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+import uuid
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -57,6 +82,8 @@ logger = logging.getLogger(__name__)
 
 executor = ThreadPoolExecutor(max_workers=4)
 SCHEDULER = get_gpu_scheduler()
+READINESS = get_readiness_manager()
+REQUEST_REGISTRY = get_request_registry()
 BATCHERS: dict[str, "MicroBatcher"] = {}
 INFLIGHT_REQUESTS = 0
 INSTANCE_NAME = os.getenv("INSTANCE_NAME", "main")
@@ -79,7 +106,47 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+OVERLOAD_RETRY_AFTER = _env_int("AI_OVERLOAD_RETRY_AFTER_SECONDS", 10)
 BATCHING_ENABLED = _env_bool("BATCHING_ENABLED", True)
+
+
+def _correlation_headers(ctx: RequestContext) -> dict[str, str]:
+    headers = {
+        "X-Request-ID": ctx.request_id,
+        "X-Run-ID": ctx.run_id,
+        "X-AI-Server-Request-ID": ctx.server_request_id or ctx.request_id,
+    }
+    if ctx.attempt_id:
+        headers["X-Attempt-ID"] = ctx.attempt_id
+    if ctx.job_id:
+        headers["X-Job-ID"] = ctx.job_id
+    if ctx.media_id:
+        headers["X-Media-ID"] = ctx.media_id
+    return headers
+
+
+def _error_body(detail: str, code: str, **extra) -> dict[str, Any]:
+    body: dict[str, Any] = {"detail": detail, "code": code}
+    body.update(extra)
+    return body
+
+
+def _error_response(
+    status_code: int,
+    detail: str,
+    code: str,
+    ctx: Optional[RequestContext] = None,
+    retry_after: Optional[int] = None,
+    **extra,
+) -> JSONResponse:
+    headers = _correlation_headers(ctx) if ctx else {}
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    return JSONResponse(
+        status_code=status_code,
+        content=_error_body(detail, code, **extra),
+        headers=headers,
+    )
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -131,12 +198,22 @@ class BatchItem:
 
 
 class MicroBatcher:
-    def __init__(self, model_key: str, max_batch_size: int, max_wait_ms: int, process_fn):
+    def __init__(
+        self,
+        model_key: str,
+        max_batch_size: int,
+        max_wait_ms: int,
+        process_fn,
+        key_fn=None,
+    ):
         self.model_key = model_key
         self.max_batch_size = max(1, max_batch_size)
         self.max_wait_ms = max(0, max_wait_ms)
         self.process_fn = process_fn
+        # Optional affinity: prefer items with the same key as the first item in the window.
+        self.key_fn = key_fn
         self.queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._pending: collections.deque[Any] = collections.deque()
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -165,15 +242,24 @@ class MicroBatcher:
         await self.queue.put(BatchItem(payload=payload, future=fut, ctx=snap))
         return await fut
 
+    async def _next_item(self, timeout: Optional[float] = None):
+        if self._pending:
+            return self._pending.popleft()
+        if timeout is None:
+            return await self.queue.get()
+        return await asyncio.wait_for(self.queue.get(), timeout=timeout)
+
     async def _run(self):
         while True:
-            first = await self.queue.get()
+            first = await self._next_item()
             if first is None:
                 break
 
             batch = [first]
             start = time.perf_counter()
             wait_sec = self.max_wait_ms / 1000.0
+            affinity_key = self.key_fn(first.payload) if self.key_fn is not None else None
+            skipped = 0
 
             while len(batch) < self.max_batch_size:
                 elapsed = time.perf_counter() - start
@@ -181,12 +267,19 @@ class MicroBatcher:
                 if remaining <= 0:
                     break
                 try:
-                    nxt = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+                    nxt = await self._next_item(timeout=remaining)
                 except asyncio.TimeoutError:
                     break
                 if nxt is None:
                     await self.queue.put(None)
                     break
+                if affinity_key is not None and self.key_fn is not None:
+                    nxt_key = self.key_fn(nxt.payload)
+                    if nxt_key != affinity_key:
+                        self._pending.append(nxt)
+                        skipped += 1
+                        # Keep waiting for matching keys until the window expires.
+                        continue
                 batch.append(nxt)
 
             payloads = [item.payload for item in batch]
@@ -203,14 +296,16 @@ class MicroBatcher:
                 effective_batch_size=len(batch),
                 batch_fill_percent=round(100.0 * len(batch) / max(self.max_batch_size, 1), 1),
                 fill_ratio=round(len(batch) / max(self.max_batch_size, 1), 3),
+                affinity_key=affinity_key if affinity_key is not None else None,
+                deferred_mismatched=skipped,
             )
             try:
                 if len(batch) > 1:
                     logger.info(
                         f"⚡ {self.model_key} micro-batch formed: size={len(batch)} "
-                        f"(max={self.max_batch_size}, wait_ms={self.max_wait_ms})"
+                        f"(max={self.max_batch_size}, wait_ms={self.max_wait_ms}"
+                        f"{f', key={affinity_key!r}' if affinity_key is not None else ''})"
                     )
-                # Prefer first item context inside executor for event correlation.
                 primary_ctx = next((item.ctx for item in batch if item.ctx is not None), None)
 
                 def _run_batch(p=payloads, ctx=primary_ctx):
@@ -237,6 +332,18 @@ class MicroBatcher:
 
 
 def _process_emotion_batch(images: list[Image.Image]) -> list[dict[str, Any]]:
+    backend = resolve_backend("emotion")
+    if backend == "triton_pending":
+        raise RuntimeError(
+            "USE_TRITON_EMOTION=true but Triton emotion model is not ready "
+            "(start scripts/start_triton.sh or unset the flag)."
+        )
+    if backend == "triton":
+        return _process_emotion_batch_triton(images)
+    return _process_emotion_batch_native(images)
+
+
+def _process_emotion_batch_native(images: list[Image.Image]) -> list[dict[str, Any]]:
     lock = get_model_lock("emotion")
     ctx = get_request_context()
 
@@ -259,7 +366,27 @@ def _process_emotion_batch(images: list[Image.Image]) -> list[dict[str, Any]]:
     return _with_oom_retry("emotion", _run)
 
 
+def _process_emotion_batch_triton(images: list[Image.Image]) -> list[dict[str, Any]]:
+    """Preprocess in FastAPI (HF processor); logits from Triton."""
+    lock = get_model_lock("emotion")
+    ctx = get_request_context()
+    with lock:
+        proc = MODELS["emotion"]["processor"]
+        # Prefer Triton labels.json; fall back to loaded HF config.
+        id2label = load_emotion_id2label()
+        if not id2label and "model" in MODELS["emotion"]:
+            id2label = {int(k): v for k, v in MODELS["emotion"]["model"].config.id2label.items()}
+        pixel_values = preprocess_emotion_pixel_values(proc, images)
+
+    def _run():
+        with SCHEDULER.run(model="emotion", batch_size=len(images), ctx=ctx, use_cuda_events=False):
+            return infer_emotion_triton(pixel_values, id2label=id2label)
+
+    return _with_oom_retry("emotion", _run)
+
+
 def _process_scene_batch(images: list[Image.Image]) -> list[dict[str, str]]:
+    require_native_or_raise("scene")
     lock = get_model_lock("scene")
     ctx = get_request_context()
 
@@ -278,6 +405,24 @@ def _process_scene_batch(images: list[Image.Image]) -> list[dict[str, str]]:
     return _with_oom_retry("scene", _run)
 
 
+def _ram_output_structure(tags_en: Any, tags_cn: Any, requested_batch: int) -> dict[str, Any]:
+    """Metadata-only description of RAM++ outputs (never includes tag text)."""
+    def _len(x: Any) -> Optional[int]:
+        if isinstance(x, (list, tuple)):
+            return len(x)
+        return None
+
+    return {
+        "output_type": type(tags_en).__name__ if tags_en is not None else "None",
+        "tuple_length": 2,
+        "requested_batch": requested_batch,
+        "tags_en_type": type(tags_en).__name__,
+        "tags_cn_type": type(tags_cn).__name__,
+        "tags_en_length": _len(tags_en),
+        "tags_cn_length": _len(tags_cn),
+    }
+
+
 def _run_ram_single(m: dict[str, Any], image: Image.Image, ctx: Optional[RequestContext]) -> tuple[Any, Any]:
     image_tensor = m["transform"](image).unsqueeze(0)
 
@@ -291,11 +436,58 @@ def _run_ram_single(m: dict[str, Any], image: Image.Image, ctx: Optional[Request
 
 
 def _process_ram_batch(images: list[Image.Image]) -> list[dict[str, Any]]:
+    backend = resolve_backend("ram_plus")
+    if backend == "triton_pending":
+        raise RuntimeError(
+            "USE_TRITON_RAM=true but Triton ram_plus model is not ready "
+            "(start/reload scripts/start_triton.sh or unset the flag)."
+        )
+    if backend == "triton":
+        return _process_ram_batch_triton(images)
+    return _process_ram_batch_native(images)
+
+
+def _process_ram_batch_triton(images: list[Image.Image]) -> list[dict[str, Any]]:
     lock = get_model_lock("ram_plus")
     ctx = get_request_context()
     with lock:
         m = MODELS["ram_plus"]
-        emit("ram_batch_attempt", model="ram_plus", batch_size=len(images))
+        emit("ram_batch_attempt", model="ram_plus", batch_size=len(images), backend="triton")
+        image_nchw = preprocess_ram_images(m["transform"], images)
+
+    def _run():
+        with SCHEDULER.run(model="ram_plus", batch_size=len(images), ctx=ctx, use_cuda_events=False):
+            return infer_ram_triton(image_nchw)
+
+    try:
+        tags_en, tags_cn = _with_oom_retry("ram_plus", _run)
+        emit("ram_batch_output_structure", **_ram_output_structure(tags_en, tags_cn, len(images)))
+        if isinstance(tags_en, list) and isinstance(tags_cn, list):
+            if len(tags_en) == len(images) and len(tags_cn) == len(images):
+                emit("ram_batch_success", model="ram_plus", batch_size=len(images), backend="triton")
+                return [{"tags_en": en, "tags_cn": cn} for en, cn in zip(tags_en, tags_cn)]
+        reason = "tag_shape_mismatch"
+    except Exception as exc:
+        reason = f"{type(exc).__name__}:{exc}"
+        logger.warning(f"RAM++ Triton batch failed, falling back native per-batch: {exc}")
+
+    emit(
+        "ram_batch_fallback",
+        model="ram_plus",
+        batch_size=len(images),
+        reason=reason,
+        backend="triton",
+        fallback_batch_size=len(images),
+    )
+    return _process_ram_batch_native(images)
+
+
+def _process_ram_batch_native(images: list[Image.Image]) -> list[dict[str, Any]]:
+    lock = get_model_lock("ram_plus")
+    ctx = get_request_context()
+    with lock:
+        m = MODELS["ram_plus"]
+        emit("ram_batch_attempt", model="ram_plus", batch_size=len(images), backend="native")
         try:
             stacked = torch.stack([m["transform"](img) for img in images])
 
@@ -303,33 +495,41 @@ def _process_ram_batch(images: list[Image.Image]) -> list[dict[str, Any]]:
                 with SCHEDULER.run(model="ram_plus", batch_size=len(images), ctx=ctx):
                     image_tensor = stacked.to(m["device"])
                     with torch.inference_mode():
-                        return inference_ram(image_tensor, m["model"])
+                        return inference_ram_batch(image_tensor, m["model"])
 
             tags_en, tags_cn = _with_oom_retry("ram_plus", _run_stacked)
+            emit("ram_batch_output_structure", **_ram_output_structure(tags_en, tags_cn, len(images)))
             if isinstance(tags_en, list) and isinstance(tags_cn, list):
                 if len(tags_en) == len(images) and len(tags_cn) == len(images):
-                    emit("ram_batch_success", model="ram_plus", batch_size=len(images))
+                    emit("ram_batch_success", model="ram_plus", batch_size=len(images), backend="native")
                     return [{"tags_en": en, "tags_cn": cn} for en, cn in zip(tags_en, tags_cn)]
             reason = "tag_shape_mismatch"
+            logger.warning(
+                "RAM++ batch output length mismatch: requested=%s en=%s cn=%s",
+                len(images),
+                len(tags_en) if isinstance(tags_en, list) else type(tags_en).__name__,
+                len(tags_cn) if isinstance(tags_cn, list) else type(tags_cn).__name__,
+            )
+            raise RuntimeError(f"RAM++ stacked batch failed: {reason}")
         except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc).startswith("RAM++ stacked batch failed"):
+                raise
             reason = f"{type(exc).__name__}:{exc}"
-            logger.warning(f"RAM++ stacked batch failed, falling back per-item: {exc}")
-
-        emit(
-            "ram_batch_fallback",
-            model="ram_plus",
-            batch_size=len(images),
-            reason=reason,
-            fallback_batch_size=1,
-        )
-        out = []
-        for img in images:
-            en, cn = _run_ram_single(m, img, ctx)
-            out.append({"tags_en": en, "tags_cn": cn})
-        return out
+            logger.warning(f"RAM++ stacked batch failed (no per-image fallback): {exc}")
+            emit(
+                "ram_batch_fallback",
+                model="ram_plus",
+                batch_size=len(images),
+                reason=reason,
+                fallback_batch_size=0,
+                backend="native",
+                disabled=True,
+            )
+            raise RuntimeError(f"RAM++ stacked batch failed: {reason}") from exc
 
 
 def _process_face_batch(images_np: list[np.ndarray]) -> list[list[Any]]:
+    require_native_or_raise("insightface")
     lock = get_model_lock("face")
     ctx = get_request_context()
     with lock:
@@ -346,6 +546,33 @@ def _process_embed_batch(texts: list[str]) -> list[list[float]]:
     """Run SentenceTransformer.encode for one or more strings; returns one vector per string (order preserved)."""
     if not texts:
         return []
+    backend = resolve_backend("embed")
+    if backend == "triton_pending":
+        raise RuntimeError(
+            "USE_TRITON_EMBED=true but Triton embed model is not ready "
+            "(start/reload scripts/start_triton.sh or unset the flag)."
+        )
+    if backend == "triton":
+        return _process_embed_batch_triton(texts)
+    return _process_embed_batch_native(texts)
+
+
+def _process_embed_batch_triton(texts: list[str]) -> list[list[float]]:
+    lock = get_model_lock("embed")
+    ctx = get_request_context()
+    with lock:
+        embedder = MODELS["embed"]
+        tokenizer = embedder.tokenizer
+        input_ids, attention_mask = tokenize_for_embed(tokenizer, texts)
+
+    def _run():
+        with SCHEDULER.run(model="embed", batch_size=len(texts), ctx=ctx, use_cuda_events=False):
+            return infer_embed_triton(input_ids, attention_mask)
+
+    return _with_oom_retry("embed", _run)
+
+
+def _process_embed_batch_native(texts: list[str]) -> list[list[float]]:
     lock = get_model_lock("embed")
     ctx = get_request_context()
     with lock:
@@ -358,7 +585,7 @@ def _process_embed_batch(texts: list[str]) -> list[list[float]]:
         def _run():
             with SCHEDULER.run(model="embed", batch_size=len(texts), ctx=ctx):
                 with torch.inference_mode():
-                    return embedder.encode(texts, **batch_size_kw)
+                    return embedder.encode(texts, normalize_embeddings=True, **batch_size_kw)
 
         out: Union[np.ndarray, torch.Tensor, list] = _with_oom_retry("embed", _run)
     if isinstance(out, torch.Tensor):
@@ -420,23 +647,44 @@ def _init_batchers():
         logger.info("ℹ️ Internal micro-batching disabled (BATCHING_ENABLED=false)")
         return
 
+    # Generative wait windows a bit longer so same-prompt / same-lang singles can coalesce.
     configs = {
-        "emotion": (_env_int("BATCH_MAX_EMOTION", 16), _env_int("BATCH_WAIT_MS_EMOTION", 8), _process_emotion_batch),
-        "scene": (_env_int("BATCH_MAX_SCENE", 8), _env_int("BATCH_WAIT_MS_SCENE", 10), _process_scene_batch),
-        "ram_plus": (_env_int("BATCH_MAX_RAM_PLUS", 8), _env_int("BATCH_WAIT_MS_RAM_PLUS", 10), _process_ram_batch),
-        "face": (_env_int("BATCH_MAX_FACE", 8), _env_int("BATCH_WAIT_MS_FACE", 8), _process_face_batch),
-        "embed": (_env_int("BATCH_MAX_EMBED", 32), _env_int("BATCH_WAIT_MS_EMBED", 8), _process_embed_microbatch_payloads),
-        "qwen_vl": (_env_int("BATCH_MAX_QWEN", 10), _env_int("BATCH_WAIT_MS_QWEN", 10), _process_qwen_microbatch),
-        "sarvam": (_env_int("BATCH_MAX_SARVAM", 10), _env_int("BATCH_WAIT_MS_SARVAM", 10), _process_sarvam_microbatch),
+        "emotion": (_env_int("BATCH_MAX_EMOTION", 16), _env_int("BATCH_WAIT_MS_EMOTION", 8), _process_emotion_batch, None),
+        "scene": (_env_int("BATCH_MAX_SCENE", 8), _env_int("BATCH_WAIT_MS_SCENE", 10), _process_scene_batch, None),
+        "ram_plus": (_env_int("BATCH_MAX_RAM_PLUS", 8), _env_int("BATCH_WAIT_MS_RAM_PLUS", 10), _process_ram_batch, None),
+        "face": (_env_int("BATCH_MAX_FACE", 8), _env_int("BATCH_WAIT_MS_FACE", 8), _process_face_batch, None),
+        "embed": (_env_int("BATCH_MAX_EMBED", 32), _env_int("BATCH_WAIT_MS_EMBED", 8), _process_embed_microbatch_payloads, None),
+        "qwen_vl": (
+            _env_int("BATCH_MAX_QWEN", 10),
+            _env_int("BATCH_WAIT_MS_QWEN", 40),
+            _process_qwen_microbatch,
+            lambda payload: _normalize_qwen_prompt(payload[1]),
+        ),
+        "sarvam": (
+            _env_int("BATCH_MAX_SARVAM", 10),
+            _env_int("BATCH_WAIT_MS_SARVAM", 40),
+            _process_sarvam_microbatch,
+            lambda payload: str(payload[1] or "").strip().lower(),
+        ),
     }
 
-    for model_key, (max_batch, wait_ms, fn) in configs.items():
+    for model_key, (max_batch, wait_ms, fn, key_fn) in configs.items():
         if model_key not in MODELS:
             continue
-        batcher = MicroBatcher(model_key=model_key, max_batch_size=max_batch, max_wait_ms=wait_ms, process_fn=fn)
+        batcher = MicroBatcher(
+            model_key=model_key,
+            max_batch_size=max_batch,
+            max_wait_ms=wait_ms,
+            process_fn=fn,
+            key_fn=key_fn,
+        )
         batcher.start()
         BATCHERS[model_key] = batcher
-        logger.info(f"⚡ Micro-batching enabled for {model_key} (max_batch={max_batch}, wait_ms={wait_ms})")
+        logger.info(
+            f"⚡ Micro-batching enabled for {model_key} "
+            f"(max_batch={max_batch}, wait_ms={wait_ms}"
+            f"{', affinity=on' if key_fn is not None else ''})"
+        )
 
 
 async def _shutdown_batchers():
@@ -446,6 +694,32 @@ async def _shutdown_batchers():
         except Exception as e:
             logger.warning(f"Failed stopping batcher {model_key}: {e}")
     BATCHERS.clear()
+
+
+def _loaded_model_keys() -> set[str]:
+    return set(MODELS.keys())
+
+
+def _warmup_required_models() -> None:
+    """Lightweight synthetic warmup for preferred batch shapes (no Qwen/Sarvam generate)."""
+    if not _env_bool("AI_STARTUP_WARMUP", True):
+        return
+    logger.info("Warming preferred batch shapes for required models...")
+    dummy = Image.new("RGB", (224, 224), color=(128, 128, 128))
+    try:
+        if MODELS.get("emotion") is not None:
+            _process_emotion_batch([dummy])
+        if MODELS.get("scene") is not None:
+            _process_scene_batch([dummy])
+        if MODELS.get("ram_plus") is not None:
+            _process_ram_batch([dummy])
+        if MODELS.get("face") is not None:
+            _process_face_batch([np.array(dummy)])
+        if MODELS.get("embed") is not None:
+            _process_embed_batch(["warmup"])
+    except Exception as exc:
+        logger.warning(f"Warmup encountered non-fatal error: {exc}")
+    logger.info("Warmup pass finished")
 
 
 async def _submit_or_run(model_key: str, payload: Any, fallback_sync):
@@ -467,22 +741,94 @@ async def lifespan(app: FastAPI):
         run_id=run_state.active_run_id(),
         instance=INSTANCE_NAME,
     )
-    logger.info("🚀 Starting Main Inference Service")
+    logger.info("🚀 Starting Main Inference Service (accepting_requests=false until warmup)")
     start = time.perf_counter()
-    load_main_models()
-    _init_batchers()
-    logger.info(f"✅ Main models loaded in {(time.perf_counter() - start):.2f}s")
-    yield
-    logger.info("🛑 Stopping Main Inference Service")
-    await _shutdown_batchers()
-    unload_models()
-    emit("server_stopped", server_run_id=run_state.server_run_id)
-    get_event_logger().flush()
-    get_event_logger().stop()
-    executor.shutdown(wait=True)
+    try:
+        load_main_models()
+        _init_batchers()
+        READINESS.mark_startup_loaded()
+        READINESS.refresh(_loaded_model_keys())
+        await asyncio.get_running_loop().run_in_executor(executor, _warmup_required_models)
+        READINESS.mark_warmed()
+        READINESS.refresh(_loaded_model_keys())
+        READINESS.open_for_traffic()
+        READINESS.start_canary(_loaded_model_keys)
+        snap = READINESS.snapshot()
+        logger.info(
+            f"✅ Main models loaded+warmed in {(time.perf_counter() - start):.2f}s "
+            f"(state={snap.service_state} accepting={snap.accepting_requests} "
+            f"reason={snap.reason} triton_ready={snap.triton_ready})"
+        )
+        if not snap.accepting_requests:
+            logger.warning(
+                "Server finished startup but is NOT accepting traffic "
+                f"(reason={snap.reason}). Fix Triton or required models before /ready=200."
+            )
+    except Exception as exc:
+        logger.exception("Startup failed")
+        READINESS.set_fatal(f"startup_failed:{exc}")
+        raise
+    try:
+        yield
+    finally:
+        logger.info("🛑 Stopping Main Inference Service (drain)")
+        READINESS.begin_drain()
+        REQUEST_REGISTRY.cancel_all_queued("server_drain")
+        drain_s = _env_int("AI_GRACEFUL_DRAIN_SECONDS", 30)
+        force_s = _env_int("AI_FORCE_SHUTDOWN_SECONDS", 90)
+        deadline = time.perf_counter() + max(drain_s, 1)
+        force_deadline = time.perf_counter() + max(force_s, drain_s)
+        while INFLIGHT_REQUESTS > 0 and time.perf_counter() < deadline:
+            await asyncio.sleep(0.25)
+        while INFLIGHT_REQUESTS > 0 and time.perf_counter() < force_deadline:
+            await asyncio.sleep(0.25)
+        READINESS.stop_canary()
+        await _shutdown_batchers()
+        unload_models()
+        emit("server_stopped", server_run_id=run_state.server_run_id)
+        get_event_logger().flush()
+        get_event_logger().stop()
+        executor.shutdown(wait=True)
 
 
 app = FastAPI(title="General Inference Server", lifespan=lifespan)
+
+
+@app.exception_handler(RequestCancelled)
+async def _handle_request_cancelled(request: Request, exc: RequestCancelled):
+    ctx = get_request_context()
+    code = exc.reason or "cancelled"
+    status = 499 if code == "client_disconnected" else (408 if code == "deadline_exceeded" else 503)
+    return _error_response(status, f"Request cancelled: {code}", code, ctx=ctx)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _handle_http_exception(request: Request, exc: StarletteHTTPException):
+    ctx = get_request_context()
+    detail = exc.detail
+    if isinstance(detail, dict):
+        body = dict(detail)
+        if "detail" not in body and "message" in body:
+            body["detail"] = body["message"]
+        if "code" not in body:
+            body["code"] = f"http_{exc.status_code}"
+        headers = _correlation_headers(ctx) if ctx else {}
+        return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
+    code = "http_error"
+    if exc.status_code == 503:
+        code = "service_unavailable"
+    elif exc.status_code == 400:
+        code = "bad_request"
+    elif exc.status_code == 429:
+        code = "admission_queue_full"
+    return _error_response(exc.status_code, str(detail), code, ctx=ctx)
+
+
+@app.exception_handler(Exception)
+async def _handle_unhandled(request: Request, exc: Exception):
+    ctx = get_request_context()
+    logger.exception("Unhandled error on %s", request.url.path)
+    return _error_response(500, str(exc) or "internal_error", "internal_error", ctx=ctx)
 
 
 @app.middleware("http")
@@ -493,7 +839,10 @@ async def track_inflight_requests(request: Request, call_next):
     timer = StageTimer()
     timer.mark_request_start()
     request_id = new_request_id(request.headers.get("x-request-id"))
+    attempt_id = new_attempt_id(request.headers.get("x-attempt-id"))
+    deadline_seconds, deadline_monotonic = parse_deadline_headers(request.headers)
     header_run = (request.headers.get("x-run-id") or "").strip()
+    server_request_id = str(uuid.uuid4())
     ctx = RequestContext(
         server_run_id=run_state.server_run_id,
         run_id=run_state.active_run_id(),
@@ -505,73 +854,129 @@ async def track_inflight_requests(request: Request, call_next):
         content_length_bytes=int(request.headers.get("content-length") or 0) or None,
         model=model_for_endpoint(request.url.path),
         timer=timer,
+        attempt_id=attempt_id,
+        server_request_id=server_request_id,
+        deadline_seconds=deadline_seconds,
+        deadline_monotonic=deadline_monotonic,
     )
     if header_run:
-        # Correlation only; campaign identity remains authoritative in run_state.
         emit("request_correlation_header", header_run_id=header_run)
     token = set_request_context(ctx)
     request.state.request_id = request_id
+    request.state.server_request_id = server_request_id
+    request.state.attempt_id = attempt_id
     request.state.run_id = ctx.run_id
     request.state.server_run_id = ctx.server_run_id
     request.state.media_id = ctx.media_id
     request.state.job_id = ctx.job_id
     admitted = False
+    registered = False
     is_process = request.url.path.startswith("/process/")
+    # Do NOT poll request.is_disconnected() concurrently with call_next.
+    # Starlette/FastAPI multipart body reads share the ASGI receive channel;
+    # a background disconnect watcher races that channel and can hang forever
+    # (curl connects, 0-byte response, QUEUED with gpu_running=0).
+    # Cancellation before GPU still works via deadline headers + request registry
+    # (checked in GpuScheduler while waiting for a slot).
+
     try:
         emit(
             "request_received",
             requested_items=None,
             content_length_bytes=ctx.content_length_bytes,
+            attempt_id=attempt_id,
+            server_request_id=server_request_id,
         )
         if is_process:
-            if SCHEDULER.reject_when_full:
-                ok = await asyncio.get_running_loop().run_in_executor(
-                    executor,
-                    lambda: SCHEDULER.acquire_admission_nowait(ctx=ctx, timer=timer),
+            snap = READINESS.snapshot()
+            if not snap.accepting_requests or snap.draining:
+                return _error_response(
+                    503,
+                    "AI server not accepting requests",
+                    "not_accepting",
+                    ctx=ctx,
+                    retry_after=OVERLOAD_RETRY_AFTER,
+                    service_state=snap.service_state,
                 )
-                if not ok:
-                    emit("queue_rejected", endpoint=ctx.endpoint)
-                    from fastapi.responses import JSONResponse
+            REQUEST_REGISTRY.register(
+                logical_request_id=request_id,
+                attempt_id=attempt_id,
+                endpoint=ctx.endpoint,
+                model=ctx.model,
+                deadline_monotonic=deadline_monotonic,
+                server_request_id=server_request_id,
+            )
+            registered = True
 
-                    return JSONResponse(
-                        status_code=429,
-                        content={"detail": "GPU admission queue full"},
-                        headers={
-                            "Retry-After": "10",
-                            "X-Request-ID": request_id,
-                            "X-Run-ID": ctx.run_id,
-                        },
-                    )
-                admitted = True
-            else:
-                await asyncio.get_running_loop().run_in_executor(
-                    executor, lambda: SCHEDULER.acquire_admission(ctx=ctx, timer=timer)
+            skip, reason = REQUEST_REGISTRY.should_skip_gpu(server_request_id)
+            if skip:
+                raise RequestCancelled(reason)
+
+            # Bounded admission: global + per-model (no unbounded wait).
+            ok, fail_model, code = await asyncio.get_running_loop().run_in_executor(
+                executor,
+                lambda: SCHEDULER.try_admit_nowait(ctx.model, ctx=ctx, timer=timer),
+            )
+            if not ok:
+                emit(
+                    "queue_rejected",
+                    endpoint=ctx.endpoint,
+                    model=fail_model,
+                    code=code or "MODEL_CAPACITY_FULL",
                 )
-                admitted = True
-        response = await call_next(request)
+                retry = SCHEDULER.server_retry_after
+                return _error_response(
+                    429,
+                    f"Capacity full for model={fail_model}",
+                    code or "MODEL_CAPACITY_FULL",
+                    ctx=ctx,
+                    retry_after=retry,
+                    model=fail_model,
+                    retryable=True,
+                )
+            admitted = True
+
+        try:
+            response = await call_next(request)
+        except RequestCancelled as exc:
+            timer.response_finished = StageTimer.now()
+            emit("request_cancelled", reason=exc.reason, **timer.as_dict())
+            if registered:
+                REQUEST_REGISTRY.mark(server_request_id, RequestState.CANCELLED, exc.reason)
+            raise
+        except Exception as exc:
+            timer.response_finished = StageTimer.now()
+            emit("request_failed", error=str(exc), **timer.as_dict())
+            if registered:
+                REQUEST_REGISTRY.mark(server_request_id, RequestState.FAILED, str(exc))
+            # Never convert infra exceptions into empty 200 — let handlers produce typed JSON.
+            raise
+
         timer.response_finished = StageTimer.now()
-        response.headers["X-Request-ID"] = request_id
-        response.headers["X-Run-ID"] = ctx.run_id
+        for k, v in _correlation_headers(ctx).items():
+            response.headers[k] = v
         if response.status_code >= 400:
-            emit(
-                "request_failed",
-                status_code=response.status_code,
-                **timer.as_dict(),
-            )
+            emit("request_failed", status_code=response.status_code, **timer.as_dict())
+            if registered:
+                REQUEST_REGISTRY.mark(server_request_id, RequestState.FAILED, f"http_{response.status_code}")
         else:
-            emit(
-                "request_completed",
-                status_code=response.status_code,
-                **timer.as_dict(),
-            )
+            emit("request_completed", status_code=response.status_code, **timer.as_dict())
+            if registered:
+                REQUEST_REGISTRY.mark(server_request_id, RequestState.COMPLETED)
         return response
+    except RequestCancelled as exc:
+        code = exc.reason or "cancelled"
+        status = 499 if code == "client_disconnected" else (408 if code == "deadline_exceeded" else 503)
+        return _error_response(status, f"Request cancelled: {code}", code, ctx=ctx)
     except Exception as exc:
         timer.response_finished = StageTimer.now()
         emit("request_failed", error=str(exc), **timer.as_dict())
         raise
     finally:
         if admitted:
-            SCHEDULER.release_admission()
+            SCHEDULER.release_admission(ctx.model, ctx=ctx)
+        if registered:
+            REQUEST_REGISTRY.unregister(server_request_id)
         reset_request_context(token)
         INFLIGHT_REQUESTS = max(0, INFLIGHT_REQUESTS - 1)
 
@@ -1335,9 +1740,49 @@ async def qwen_caption_batch(
 
 @app.get("/health")
 def health():
+    """Liveness only — does not require models or readiness."""
+    return {"status": "alive"}
+
+
+@app.get("/ready")
+def ready():
+    """Cached readiness — never runs Face/Scene/Qwen inference."""
+    READINESS.refresh(_loaded_model_keys())
+    snap = READINESS.snapshot()
+    body = snap.as_dict()
+    body["instance"] = INSTANCE_NAME
+    body["inflight_requests"] = INFLIGHT_REQUESTS
+    body["scheduler"] = SCHEDULER.snapshot()
+    body["registry"] = REQUEST_REGISTRY.counts()
+    status = 200 if body["status"] == "ready" else 503
+    headers = {"Retry-After": str(OVERLOAD_RETRY_AFTER)} if status == 503 else None
+    return JSONResponse(status_code=status, content=body, headers=headers)
+
+
+@app.get("/internal/capacity")
+def internal_capacity():
+    """Capacity contract for Processing startup validation (exact scalable schema)."""
+    return build_capacity_response()
+
+
+@app.post("/internal/drain")
+def internal_drain():
+    """Begin graceful drain: /ready → 503; /process/* → 503."""
+    READINESS.begin_drain()
+    cancelled = REQUEST_REGISTRY.cancel_all_queued("server_drain")
+    return {
+        "status": "draining",
+        "cancelled_queued": cancelled,
+        "inflight_requests": INFLIGHT_REQUESTS,
+        **READINESS.snapshot().as_dict(),
+    }
+
+
+@app.get("/internal/runtime")
+def internal_runtime():
+    """Detailed diagnostics (not for LB probes)."""
     status = get_runtime_model_status()
     run_state = get_run_state()
-    sched = SCHEDULER.snapshot()
     face = get_face_provider_status()
     return {
         "status": "ok",
@@ -1347,7 +1792,9 @@ def health():
         "server_run_id": run_state.server_run_id,
         "campaign_run_id": run_state.campaign_run_id,
         "campaign_state": run_state.campaign_state,
-        "scheduler": sched,
+        "readiness": READINESS.snapshot().as_dict(),
+        "scheduler": SCHEDULER.snapshot(),
         "face_provider_pass": face.get("pass"),
+        "triton": triton_runtime_status(),
         **status,
     }

@@ -1,0 +1,28 @@
+name: "ram_plus"
+platform: "onnxruntime_onnx"
+max_batch_size: 16
+default_model_filename: "model.onnx"
+input [
+  {
+    name: "image"
+    data_type: TYPE_FP32
+    dims: [ 3, 384, 384 ]
+  }
+]
+output [
+  {
+    name: "logits"
+    data_type: TYPE_FP32
+    dims: [ 4585 ]
+  }
+]
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
+dynamic_batching {
+  preferred_batch_size: [ 4, 8, 16 ]
+  max_queue_delay_microseconds: 5000
+}

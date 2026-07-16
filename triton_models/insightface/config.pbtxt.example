@@ -1,0 +1,13 @@
+# PLACEHOLDER — Phase 4 will split InsightFace into detector / recognizer / landmark / gender_age.
+# Do not enable USE_TRITON_FACE until true batched tensor stages replace FaceAnalysis.get loops.
+#
+# name: "insightface"
+# platform: "onnxruntime_onnx"
+# max_batch_size: 1
+# input [
+#   { name: "input", data_type: TYPE_FP32, dims: [ 3, -1, -1 ] }
+# ]
+# output [
+#   { name: "output", data_type: TYPE_FP32, dims: [ -1 ] }
+# ]
+# instance_group [ { count: 1, kind: KIND_GPU } ]

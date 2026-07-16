@@ -299,7 +299,15 @@ curl -sS -X POST "http://127.0.0.1:8001/process/caption/qwen/batch" \
 
 ## `GET /health`
 
-No body. Returns service status, loaded model keys, and optional CUDA memory stats.
+Liveness only. No body. Returns `{"status":"alive"}` as soon as the process can answer HTTP — **does not** require models, GPU, or Triton.
+
+## `GET /ready`
+
+Cached readiness from `ReadinessManager` (never runs Face/Scene/Qwen inference in the probe). **200** when accepting traffic; **503** with `Retry-After` while starting, warming, degraded-not-open, draining, or missing required models / Triton. Includes `accepting_requests`, `draining`, `service_state`, scheduler snapshot.
+
+Detailed diagnostics (models, Triton backends, campaign): `GET /internal/runtime`. Graceful drain: `POST /internal/drain`.
+
+Phase 2 `triton` object remains on `/internal/runtime` (not on slim `/health`).
 
 ---
 

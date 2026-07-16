@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start one long-lived main:app behind NGINX :9000.
-# Uses uv-managed .venv by default; falls back to .venv-cu12 if present.
+# Prefers .venv with CUDA 12 cublas; falls back to .venv-cu12 if needed.
 
 set -euo pipefail
 
@@ -19,12 +19,33 @@ PORT=9001
 
 cd "$PROJECT_DIR" || exit 1
 
-if [[ -x "$VENV_UV/bin/uvicorn" ]]; then
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$PROJECT_DIR/.env"
+  set +a
+fi
+
+is_true() {
+  local v="${1:-}"
+  [[ "${v,,}" == "true" || "$v" == "1" || "${v,,}" == "yes" || "${v,,}" == "on" ]]
+}
+
+_has_cublas12() {
+  local root="$1"
+  [[ -f "$root/lib/python3.12/site-packages/nvidia/cublas/lib/libcublasLt.so.12" ]] \
+    || [[ -n "$(find "$root/lib" -name 'libcublasLt.so.12' 2>/dev/null | head -n 1)" ]]
+}
+
+if [[ -x "$VENV_UV/bin/uvicorn" ]] && _has_cublas12 "$VENV_UV"; then
   VENV_PATH="$VENV_UV"
-  echo "Using uv venv: $VENV_PATH"
-elif [[ -x "$VENV_CU12/bin/uvicorn" ]]; then
+  echo "Using uv venv (CUDA 12): $VENV_PATH"
+elif [[ -x "$VENV_CU12/bin/uvicorn" ]] && _has_cublas12 "$VENV_CU12"; then
   VENV_PATH="$VENV_CU12"
-  echo "Using legacy .venv-cu12: $VENV_PATH"
+  echo "Using .venv-cu12 (CUDA 12): $VENV_PATH"
+elif [[ -x "$VENV_UV/bin/uvicorn" ]]; then
+  VENV_PATH="$VENV_UV"
+  echo "WARNING: $VENV_PATH lacks libcublasLt.so.12 — InsightFace CUDA may fail. Fix with: uv sync" >&2
 else
   echo "ERROR: no venv with uvicorn. Run: uv venv .venv --python 3.12 && uv sync" >&2
   exit 1
@@ -35,15 +56,101 @@ PYTHON_BIN="$VENV_PATH/bin/python"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR" "$REPORT_DIR"
 
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
-export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
-export ALLOW_HF_FALLBACK="${ALLOW_HF_FALLBACK:-1}"
+export AI_OFFLINE_MODE="${AI_OFFLINE_MODE:-false}"
+if is_true "$AI_OFFLINE_MODE"; then
+  # Single-flag offline mode: force local-only model resolution.
+  export HF_HUB_OFFLINE="1"
+  export TRANSFORMERS_OFFLINE="1"
+  export ALLOW_HF_FALLBACK="0"
+else
+  export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+  export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-0}"
+  export ALLOW_HF_FALLBACK="${ALLOW_HF_FALLBACK:-1}"
+fi
+
+# Fail fast in offline mode so operators download/export assets before start.
+if is_true "$AI_OFFLINE_MODE"; then
+  echo "AI_OFFLINE_MODE=true — verifying local models / Triton assets before start..."
+  if ! "$PYTHON_BIN" "$PROJECT_DIR/bootstrap_local_models.py" --verify-only; then
+    echo "ERROR: Offline start blocked — required local assets are missing." >&2
+    echo "  1) Go online and run: uv run python bootstrap_local_models.py" >&2
+    echo "  2) If USE_TRITON_*=true: docker pull \${TRITON_IMAGE:-nvcr.io/nvidia/tritonserver:24.08-py3}" >&2
+    echo "  3) Export Triton ONNX as needed: tools/export_emotion_onnx.py / export_embed_onnx.py / export_ram_onnx.py" >&2
+    echo "  4) Confirm: uv run python bootstrap_local_models.py --verify-only" >&2
+    echo "  5) Then start again with AI_OFFLINE_MODE=true" >&2
+    exit 1
+  fi
+  echo "Offline asset verification passed."
+fi
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export REQUIRE_FACE_CUDA="${REQUIRE_FACE_CUDA:-true}"
-export GPU_QUEUE_REJECT_WHEN_FULL="${GPU_QUEUE_REJECT_WHEN_FULL:-false}"
-export MAX_WAITING_GPU_REQUESTS="${MAX_WAITING_GPU_REQUESTS:-16}"
+export GPU_EXECUTION_SLOTS="${GPU_EXECUTION_SLOTS:-1}"
+export AI_CAPACITY_PROFILE="${AI_CAPACITY_PROFILE:-l40s-scalable-lanes-v1}"
+export MAX_PARALLEL_MEDIA="${MAX_PARALLEL_MEDIA:-2}"
+export PER_MEDIA_AI_INFLIGHT="${PER_MEDIA_AI_INFLIGHT:-8}"
+export PER_MEDIA_MODEL_INFLIGHT="${PER_MEDIA_MODEL_INFLIGHT:-1}"
+# AI accepted queue / GPU slots are independent of MAX_PARALLEL_MEDIA.
+export AI_ACCEPTED_QUEUE_LIMIT="${AI_ACCEPTED_QUEUE_LIMIT:-6}"
+export AI_MAX_ACCEPTED_INFERENCE_REQUESTS="${AI_MAX_ACCEPTED_INFERENCE_REQUESTS:-$AI_ACCEPTED_QUEUE_LIMIT}"
+export AI_INTERNAL_MAX_WAITING_REQUESTS="${AI_INTERNAL_MAX_WAITING_REQUESTS:-$AI_ACCEPTED_QUEUE_LIMIT}"
+export MAX_WAITING_GPU_REQUESTS="${MAX_WAITING_GPU_REQUESTS:-$AI_INTERNAL_MAX_WAITING_REQUESTS}"
+export AI_INTERNAL_REJECT_WHEN_FULL="${AI_INTERNAL_REJECT_WHEN_FULL:-true}"
+export GPU_QUEUE_REJECT_WHEN_FULL="${GPU_QUEUE_REJECT_WHEN_FULL:-$AI_INTERNAL_REJECT_WHEN_FULL}"
+export AI_OVERLOAD_RETRY_AFTER_SECONDS="${AI_OVERLOAD_RETRY_AFTER_SECONDS:-10}"
+export AI_MODEL_OVERLOAD_RETRY_AFTER_SECONDS="${AI_MODEL_OVERLOAD_RETRY_AFTER_SECONDS:-10}"
+export AI_MAX_ACTIVE_GENERATIVE_REQUESTS="${AI_MAX_ACTIVE_GENERATIVE_REQUESTS:-1}"
+export AI_MAX_ACTIVE_QWEN_REQUESTS="${AI_MAX_ACTIVE_QWEN_REQUESTS:-1}"
+export AI_MAX_ACTIVE_SARVAM_REQUESTS="${AI_MAX_ACTIVE_SARVAM_REQUESTS:-1}"
+export AI_COMBINED_GENERATIVE_LIMIT_ENABLED="${AI_COMBINED_GENERATIVE_LIMIT_ENABLED:-false}"
+export AI_GPU_SLOTS_VISUAL="${AI_GPU_SLOTS_VISUAL:-1}"
+export AI_GPU_SLOTS_QWEN="${AI_GPU_SLOTS_QWEN:-1}"
+export AI_GPU_SLOTS_SARVAM="${AI_GPU_SLOTS_SARVAM:-1}"
+export AI_VISUAL_EXECUTION_SLOTS="${AI_VISUAL_EXECUTION_SLOTS:-$AI_GPU_SLOTS_VISUAL}"
+export AI_QWEN_EXECUTION_SLOTS="${AI_QWEN_EXECUTION_SLOTS:-$AI_GPU_SLOTS_QWEN}"
+export AI_SARVAM_EXECUTION_SLOTS="${AI_SARVAM_EXECUTION_SLOTS:-$AI_GPU_SLOTS_SARVAM}"
+export AI_ENABLE_VISUAL_QWEN_OVERLAP="${AI_ENABLE_VISUAL_QWEN_OVERLAP:-false}"
+export AI_ENABLE_VISUAL_SARVAM_OVERLAP="${AI_ENABLE_VISUAL_SARVAM_OVERLAP:-false}"
+export AI_ENABLE_QWEN_SARVAM_OVERLAP="${AI_ENABLE_QWEN_SARVAM_OVERLAP:-true}"
+export AI_GRACEFUL_DRAIN_SECONDS="${AI_GRACEFUL_DRAIN_SECONDS:-30}"
+export AI_FORCE_SHUTDOWN_SECONDS="${AI_FORCE_SHUTDOWN_SECONDS:-90}"
+export AI_REQUIRED_MODELS="${AI_REQUIRED_MODELS:-face,emotion,scene,ram_plus,embeddings}"
+export AI_OPTIONAL_MODELS="${AI_OPTIONAL_MODELS:-qwen,sarvam_translation}"
+export AI_MODEL_CANARY_INTERVAL_SECONDS="${AI_MODEL_CANARY_INTERVAL_SECONDS:-300}"
+export AI_STARTUP_WARMUP="${AI_STARTUP_WARMUP:-true}"
 export ENABLE_CUDNN_BENCHMARK="${ENABLE_CUDNN_BENCHMARK:-false}"
 export INSTANCE_NAME="${INSTANCE_NAME:-ai-01}"
+
+# Phase 2 Triton flags — all off. Public API stays native FastAPI.
+export TRITON_HTTP_URL="${TRITON_HTTP_URL:-http://127.0.0.1:8001}"
+export TRITON_GRPC_URL="${TRITON_GRPC_URL:-127.0.0.1:8002}"
+export USE_TRITON_EMOTION="${USE_TRITON_EMOTION:-true}"
+export USE_TRITON_RAM="${USE_TRITON_RAM:-false}"
+export USE_TRITON_SCENE="${USE_TRITON_SCENE:-false}"
+export USE_TRITON_EMBED="${USE_TRITON_EMBED:-true}"
+export USE_TRITON_FACE="${USE_TRITON_FACE:-false}"
+export GPU_FAIRNESS="${GPU_FAIRNESS:-true}"
+export GPU_VISUAL_SHARE="${GPU_VISUAL_SHARE:-0.6}"
+# Coalesce same-prompt / same-lang singles into denser GPU batches.
+export BATCH_WAIT_MS_QWEN="${BATCH_WAIT_MS_QWEN:-40}"
+export BATCH_WAIT_MS_SARVAM="${BATCH_WAIT_MS_SARVAM:-40}"
+
+# When any USE_TRITON_*=true, Triton must be live or /ready stays 503.
+_need_triton=0
+for _f in USE_TRITON_EMOTION USE_TRITON_RAM USE_TRITON_SCENE USE_TRITON_EMBED USE_TRITON_FACE; do
+  _v="${!_f:-false}"
+  if [[ "${_v,,}" == "true" || "${_v}" == "1" || "${_v,,}" == "yes" || "${_v,,}" == "on" ]]; then
+    _need_triton=1
+    break
+  fi
+done
+if [[ "$_need_triton" -eq 1 ]]; then
+  echo "Triton required by USE_TRITON_* flags — ensuring scripts/start_triton.sh ..."
+  bash "$SCRIPT_DIR/start_triton.sh" || {
+    echo "ERROR: Triton failed to start but USE_TRITON_*=true. /ready will stay 503." >&2
+    echo "  Fix: bash scripts/start_triton.sh   OR set USE_TRITON_EMOTION=false USE_TRITON_EMBED=false" >&2
+    exit 1
+  }
+fi
 
 # Match 2x HTTP batch caps used by Processing Server.
 export FACE_BATCH_MAX=$(( ${FACE_BATCH_MAX:-8} * 2 ))
@@ -52,6 +159,7 @@ export SCENE_BATCH_MAX=$(( ${SCENE_BATCH_MAX:-8} * 2 ))
 export RAM_BATCH_MAX=$(( ${RAM_BATCH_MAX:-8} * 2 ))
 export QWEN_BATCH_MAX=$(( ${QWEN_BATCH_MAX:-10} * 2 ))
 export SARVAM_BATCH_MAX=$(( ${SARVAM_BATCH_MAX:-10} * 2 ))
+export EMBED_BATCH_MAX="${EMBED_BATCH_MAX:-32}"
 
 if [[ -d "$VENV_PATH/lib" ]]; then
   EXTRA_LIB="$(find "$VENV_PATH/lib" -type d \( -path '*/nvidia/*/lib' -o -path '*/onnxruntime/capi' \) 2>/dev/null | paste -sd: - || true)"
@@ -95,31 +203,38 @@ echo $! >"$PID_FILE"
 APP_PID="$(cat "$PID_FILE")"
 echo "Started app PID $APP_PID (log: $LOG_FILE)"
 
-wait_for_health() {
-  local url="http://127.0.0.1:${PORT}/health"
+wait_for_ready() {
+  local url="http://127.0.0.1:${PORT}/ready"
+  local live="http://127.0.0.1:${PORT}/health"
   local elapsed=0
   local code
-  echo "Waiting for health at $url (timeout ${HEALTH_TIMEOUT_SEC}s)..."
+  echo "Waiting for readiness at $url (timeout ${HEALTH_TIMEOUT_SEC}s; /health is liveness-only)..."
   while (( elapsed < HEALTH_TIMEOUT_SEC )); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$url" 2>/dev/null || true)"
+    code="$(curl -s -o /tmp/ai_ready_wait.json -w '%{http_code}' --connect-timeout 2 --max-time 5 "$url" 2>/dev/null || true)"
     if [[ "$code" == "200" ]]; then
-      echo "Healthy (HTTP 200)."
+      echo "Ready (HTTP 200)."
       return 0
     fi
+    live_code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 "$live" 2>/dev/null || true)"
+    reason="$(python3 -c 'import json; print(json.load(open("/tmp/ai_ready_wait.json")).get("reason") or json.load(open("/tmp/ai_ready_wait.json")).get("service_state",""))' 2>/dev/null || echo "?")"
+    if [[ "$live_code" == "200" ]]; then
+      echo "  alive but not ready yet (ready_http=${code} reason=${reason}) t=${elapsed}s"
+    fi
     if ! kill -0 "$APP_PID" 2>/dev/null; then
-      echo "ERROR: app exited before healthy. Tail of log:" >&2
+      echo "ERROR: app exited before ready. Tail of log:" >&2
       tail -n 80 "$LOG_FILE" >&2 || true
       return 1
     fi
     sleep "$HEALTH_POLL_SEC"
     elapsed=$((elapsed + HEALTH_POLL_SEC))
   done
-  echo "ERROR: health timeout" >&2
+  echo "ERROR: readiness timeout (last reason=${reason:-unknown})" >&2
+  python3 -m json.tool </tmp/ai_ready_wait.json 2>/dev/null | head -n 40 >&2 || true
   tail -n 80 "$LOG_FILE" >&2 || true
   return 1
 }
 
-wait_for_health
+wait_for_ready
 
 start_helper() {
   local helper_name="$1"

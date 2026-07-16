@@ -1,0 +1,7 @@
+{
+  "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+  "embedding_dim": 384,
+  "max_seq_length": 128,
+  "normalize": true,
+  "pooling": "mean"
+}

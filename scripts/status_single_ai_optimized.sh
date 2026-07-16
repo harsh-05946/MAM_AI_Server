@@ -37,10 +37,18 @@ if [[ -f runtime_reports/current/current_run.json ]]; then
 fi
 
 if curl -s --max-time 5 http://127.0.0.1:9001/health >/tmp/ai_health.json 2>/dev/null; then
-  echo "health (9001):"
-  python3 -m json.tool </tmp/ai_health.json | head -n 80
+  echo "health/liveness (9001):"
+  python3 -m json.tool </tmp/ai_health.json | head -n 20
 else
   echo "health (9001): unreachable"
+fi
+
+if curl -s -o /tmp/ai_ready.json -w '%{http_code}' --max-time 5 http://127.0.0.1:9001/ready >/tmp/ai_ready_code.txt 2>/dev/null; then
+  code="$(cat /tmp/ai_ready_code.txt 2>/dev/null || echo '?')"
+  echo "ready (9001) HTTP ${code}:"
+  python3 -m json.tool </tmp/ai_ready.json | head -n 40
+else
+  echo "ready (9001): unreachable"
 fi
 
 echo

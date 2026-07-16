@@ -1,0 +1,19 @@
+{
+  "profile": "l40s-scalable-lanes-v1",
+  "profile_version": 1,
+  "scalable_fleet": true,
+  "capacity_contract_required": true,
+  "global_inflight": 8,
+  "per_media_inflight": 8,
+  "per_media_model_inflight": 1,
+  "models": {
+    "face": {"max_concurrent": 1, "batch": 16},
+    "emotion": {"max_concurrent": 1, "batch": 64},
+    "scene": {"max_concurrent": 1, "batch": 16},
+    "object": {"max_concurrent": 1, "batch": 16},
+    "qwen": {"max_concurrent": 1, "batch": 20},
+    "sarvam": {"max_concurrent": 1, "batch": 20},
+    "embeddings": {"max_concurrent": 1, "batch": 32}
+  },
+  "qwen_sarvam_parallel": true
+}

@@ -17,10 +17,13 @@ def main() -> int:
     from models import (
         FaceAnalysis,
         REQUIRE_FACE_CUDA,
+        _ensure_offline_face_assets,
+        _insightface_root,
         _preload_ort_cuda_libs,
         validate_face_providers,
     )
 
+    _ensure_offline_face_assets()
     _preload_ort_cuda_libs()
     providers = [
         (
@@ -36,9 +39,9 @@ def main() -> int:
         "CPUExecutionProvider",
     ]
     try:
-        face_app = FaceAnalysis(name="buffalo_l", providers=providers)
+        face_app = FaceAnalysis(name="buffalo_l", root=str(_insightface_root()), providers=providers)
     except TypeError:
-        face_app = FaceAnalysis(name="buffalo_l")
+        face_app = FaceAnalysis(name="buffalo_l", root=str(_insightface_root()))
     face_app.prepare(ctx_id=0, det_size=(640, 640))
     status = validate_face_providers(face_app)
     print(json.dumps(status, indent=2))

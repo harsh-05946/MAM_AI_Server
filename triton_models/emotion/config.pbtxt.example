@@ -1,0 +1,13 @@
+# PLACEHOLDER — do not rename to config.pbtxt until an ONNX/TensorRT artifact exists.
+#
+# name: "emotion"
+# platform: "onnxruntime_onnx"
+# max_batch_size: 64
+# input [
+#   { name: "pixel_values", data_type: TYPE_FP32, dims: [ 3, 224, 224 ] }
+# ]
+# output [
+#   { name: "logits", data_type: TYPE_FP32, dims: [ 7 ] }
+# ]
+# instance_group [ { count: 1, kind: KIND_GPU } ]
+# dynamic_batching { }
